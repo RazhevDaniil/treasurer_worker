@@ -1,0 +1,36 @@
+# LangGraph and LangChain
+langgraph==1.1.4
+langgraph-checkpoint==4.0.1
+langgraph-prebuilt==1.0.8
+langgraph-sdk==0.3.12
+langgraph-checkpoint-postgres>=1.0.0
+langchain>=1.0.0
+langchain-core==1.2.26
+langchain-community==0.4.1
+langchain-gigachat==0.5.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=1.0.0
+simsimd>=6.5.3
+# langgraph-checkpoint-redis>=0.3.0  # optional: for Redis checkpointer
+
+# Database
+asyncpg>=0.29.0
+psycopg[binary,pool]>=3.1.0
+
+# Kafka
+confluent-kafka>=2.3.0
+
+# AEF Tracing SDK (SECURITY §18/§20/§21/§26 — proto trace into AEF Controller Kafka)
+sber-aef-tracing
+
+# CLI
+click>=8.0.0
+
+# REST
+fastapi~=0.115.9
+uvicorn~=0.34.1
+requests~=2.32.5
+httpx>=0.28.0
+tenacity>=8.2.0
+pydantic~=2.11.0
+pydantic-settings~=2.11.0

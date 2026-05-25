@@ -1,0 +1,50 @@
+namespace: agnbf-dt-kmhelp-corpdep
+wrapper: 1.0.0.aef.fastapi
+
+app:
+  author: Колодяжный Максим Алексеевич
+  emails:
+  unit:
+  description: LangGraph-агент автоматических переговоров по сделкам на основе GigaChat
+  language: PYTHON
+  pyinstaller:
+    hidden-import:
+      - asyncpg.pgproto.pgproto
+      - fastapi
+      - starlette
+      - uvicorn
+      - anyio
+      - pydantic
+  connections:
+    endpoints:
+      - alias: GIGACHAT_API_URL
+        description: Базовый URL GigaChat REST API (без /v1)
+      - alias: DB_APP_URL
+        description: Base URL сервиса db_app
+      - alias: MAIL_SERVER_API_URL
+        description: Base URL сервиса mail_app
+      - alias: TOOL_API_URL
+        description: Base URL сервиса agent_tools_app (расчёт ставок)
+      - alias: POD_NAMESPACE
+        description: Идентификатор пространства имен
+      - alias: TRACING_SERVICE_KAFKA_BOOTSTRAP_SERVERS
+        description: Хосты брокера кафки для передачи трейсинга в ФП AEF Controller
+      - alias: TRACING_SERVICE_KAFKA_OUTBOX_TOPIC
+        description: Топик брокера кафки для передачи трейсинга в ФП AEF Controller
+      - alias: ADAPTER_BROKERS
+        description: Хосты бизнесового Kafka-кластера (approve ↔ agent, mail → agent)
+      - alias: KAFKA_OUT_TOPIC
+        description: Входящий топик — задания на согласование от approve-service
+      - alias: KAFKA_IN_TOPIC
+        description: Исходящий топик — результат согласования в approve-service
+      - alias: KAFKA_MAIL_TOPIC
+        description: Входящий топик — письма-переговоры от post-service (mail_app)
+    databases:
+      - alias: deal-agent-db
+        description: PostgreSQL база данных для хранения состояния LangGraph-чекпоинтера и таблиц агента
+  envs:
+    APP_HOST: "0.0.0.0"
+    APP_PORT: "8081"
+    AGENT_ID: CI13858148
+    CLUSTER_ID:
+    DISTRIBUTIVE:
