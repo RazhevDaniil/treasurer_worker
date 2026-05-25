@@ -83,6 +83,8 @@ async def mailman_send_response_node(state: AgentState) -> dict[str, Any]:
             AIMessage(content=state.response_message),
         ]
         result["message_history"] = [state.incoming_message]
+    if state.incoming_message_id:
+        result["last_processed_message_id"] = state.incoming_message_id
 
     logger.info(
         f"mailman_send_ok. response={state.response_message} "

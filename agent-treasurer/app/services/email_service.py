@@ -57,16 +57,13 @@ class EmailService:
     def __init__(self):
         self.base_url = settings.mail_server_api_url
         self.account_id = settings.mail_account_id
-        self._client: Optional[httpx.AsyncClient] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                timeout=30.0,
-            )
-        return self._client
+    def _client(self) -> httpx.AsyncClient:
+        """Create an HTTP client bound to the current event loop."""
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=30.0,
+        )
 
     async def send_email(
         self,
@@ -77,6 +74,7 @@ class EmailService:
         references: Optional[str] = None,
         thread_id: Optional[str] = None,
         cc: Optional[list[str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> bool:
         """
         Send an email via the mail server API (POST /api/v1/send_reply).
@@ -95,6 +93,7 @@ class EmailService:
             "references": references,
             "thread_id": thread_id,
             "cc": cc,
+            "idempotency_key": idempotency_key,
         }
 
         # SECURITY §20 (4) — mark mutating action on the AEF span.
@@ -105,24 +104,25 @@ class EmailService:
             "aef.rollback_possible": False,
         }):
             try:
-                async for attempt in AsyncRetrying(
-                    retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                    stop=stop_after_attempt(settings.http_max_retries),
-                    wait=wait_exponential_jitter(
-                        initial=settings.http_retry_base,
-                        max=settings.http_retry_max,
-                    ),
-                    before_sleep=_log_http_retry,
-                    reraise=True,
-                ):
-                    with attempt:
-                        response = await client.post(
-                            "/api/v1/send_reply",
-                            json=payload,
-                            headers={"X-Account-ID": self.account_id},
-                        )
-                        if _retryable_status(response.status_code):
-                            response.raise_for_status()
+                async with self._client() as client:
+                    async for attempt in AsyncRetrying(
+                        retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
+                        stop=stop_after_attempt(settings.http_max_retries),
+                        wait=wait_exponential_jitter(
+                            initial=settings.http_retry_base,
+                            max=settings.http_retry_max,
+                        ),
+                        before_sleep=_log_http_retry,
+                        reraise=True,
+                    ):
+                        with attempt:
+                            response = await client.post(
+                                "/api/v1/send_reply",
+                                json=payload,
+                                headers={"X-Account-ID": self.account_id},
+                            )
+                            if _retryable_status(response.status_code):
+                                response.raise_for_status()
                 response.raise_for_status()
                 logger.info(f"send_email_ok. to={to} subject={subject}")
                 return True
@@ -153,31 +153,30 @@ class EmailService:
         # TODO: Implement actual API call to mail server
         # GET /api/v1/imap/emails
 
-        client = await self._get_client()
-
         try:
-            async for attempt in AsyncRetrying(
-                retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                stop=stop_after_attempt(settings.http_max_retries),
-                wait=wait_exponential_jitter(
-                    initial=settings.http_retry_base,
-                    max=settings.http_retry_max,
-                ),
-                before_sleep=_log_http_retry,
-                reraise=True,
-            ):
-                with attempt:
-                    response = await client.get(
-                        f"/api/v1/imap/emails",
-                        params={
-                            "folder": folder,
-                            "limit": limit,
-                            "unread_only": True,
-                        },
-                        headers={"X-Account-ID": self.account_id},
-                    )
-                    if _retryable_status(response.status_code):
-                        response.raise_for_status()
+            async with self._client() as client:
+                async for attempt in AsyncRetrying(
+                    retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
+                    stop=stop_after_attempt(settings.http_max_retries),
+                    wait=wait_exponential_jitter(
+                        initial=settings.http_retry_base,
+                        max=settings.http_retry_max,
+                    ),
+                    before_sleep=_log_http_retry,
+                    reraise=True,
+                ):
+                    with attempt:
+                        response = await client.get(
+                            f"/api/v1/imap/emails",
+                            params={
+                                "folder": folder,
+                                "limit": limit,
+                                "unread_only": True,
+                            },
+                            headers={"X-Account-ID": self.account_id},
+                        )
+                        if _retryable_status(response.status_code):
+                            response.raise_for_status()
             response.raise_for_status()
             data = response.json()
             emails = data.get("emails", [])
@@ -202,8 +201,6 @@ class EmailService:
         # TODO: Implement actual API call
         # POST /api/v1/imap/mark-read
 
-        client = await self._get_client()
-
         # SECURITY §20 (4) — mark mutating action on the AEF span.
         with aef_custom_span(span_attributes={
             "aef.kind": "other",
@@ -212,27 +209,28 @@ class EmailService:
             "aef.rollback_possible": False,
         }):
             try:
-                async for attempt in AsyncRetrying(
-                    retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                    stop=stop_after_attempt(settings.http_max_retries),
-                    wait=wait_exponential_jitter(
-                        initial=settings.http_retry_base,
-                        max=settings.http_retry_max,
-                    ),
-                    before_sleep=_log_http_retry,
-                    reraise=True,
-                ):
-                    with attempt:
-                        response = await client.post(
-                            f"/api/v1/imap/mark-read",
-                            json={
-                                "folder": folder,
-                                "uids": message_uids,
-                            },
-                            headers={"X-Account-ID": self.account_id},
-                        )
-                        if _retryable_status(response.status_code):
-                            response.raise_for_status()
+                async with self._client() as client:
+                    async for attempt in AsyncRetrying(
+                        retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
+                        stop=stop_after_attempt(settings.http_max_retries),
+                        wait=wait_exponential_jitter(
+                            initial=settings.http_retry_base,
+                            max=settings.http_retry_max,
+                        ),
+                        before_sleep=_log_http_retry,
+                        reraise=True,
+                    ):
+                        with attempt:
+                            response = await client.post(
+                                f"/api/v1/imap/mark-read",
+                                json={
+                                    "folder": folder,
+                                    "uids": message_uids,
+                                },
+                                headers={"X-Account-ID": self.account_id},
+                            )
+                            if _retryable_status(response.status_code):
+                                response.raise_for_status()
                 response.raise_for_status()
                 logger.debug(f"mark_as_read_ok. folder={folder} count={len(message_uids)}")
                 return True
@@ -243,5 +241,4 @@ class EmailService:
 
     async def close(self):
         """Close HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        return None

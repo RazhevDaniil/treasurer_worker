@@ -50,6 +50,16 @@ class AgentState(BaseModel):
         description="Text of the current incoming message"
     )
 
+    incoming_message_id: Optional[str] = Field(
+        None,
+        description="External message id for idempotent mail processing"
+    )
+
+    last_processed_message_id: Optional[str] = Field(
+        None,
+        description="Last external message id that produced response_message"
+    )
+
     # === Multi-deal State ===
     deals: list[Deal] = Field(
         default_factory=list,

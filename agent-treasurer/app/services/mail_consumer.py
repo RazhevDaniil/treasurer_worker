@@ -145,6 +145,15 @@ class MailIncomingConsumer:
                     self._consumer.commit(message=msg)
                     return
 
+                if result.get("sent") is False:
+                    logger.error(
+                        f"mail_reply_not_queued. thread_id={thread_id} "
+                        f"message_id={message_id} destination={result.get('destination')}"
+                    )
+                    agent_span.add_span_attributes(**{"aef.stop_event": "mail_reply_not_queued"})
+                    agent_span.add_output_result(output=result)
+                    return
+
                 self._consumer.commit(message=msg)
                 agent_span.add_output_result(output=result)
 
@@ -167,24 +176,39 @@ class MailIncomingConsumer:
         пользователю уходит через EmailService (HTTP POST /send_reply).
         """
         callbacks = [get_aef_handler()]
+        message_id = payload.get("message_id") or ""
 
         try:
             existing = await get_thread_state(thread_id, self._checkpointer)
-            if existing is not None and existing.awaiting_reply:
+            if (
+                message_id
+                and existing is not None
+                and existing.last_processed_message_id == message_id
+                and existing.response_message
+            ):
+                logger.info(
+                    f"mail_duplicate_message_reusing_response. "
+                    f"thread_id={thread_id} message_id={message_id}"
+                )
+                final_state = existing
+            elif existing is not None and existing.awaiting_reply:
                 coro = resume_with_message(
                     message=message_text,
                     thread_id=thread_id,
                     checkpointer=self._checkpointer,
+                    incoming_message_id=message_id or None,
                     callbacks=callbacks,
                 )
+                final_state = await asyncio.wait_for(coro, timeout=settings.operation_ttl_sec)
             else:
                 coro = process_message(
                     message=message_text,
                     checkpointer=self._checkpointer,
                     thread_id=thread_id,
+                    incoming_message_id=message_id or None,
                     callbacks=callbacks,
                 )
-            final_state = await asyncio.wait_for(coro, timeout=settings.operation_ttl_sec)
+                final_state = await asyncio.wait_for(coro, timeout=settings.operation_ttl_sec)
         except asyncio.TimeoutError:
             logger.error(
                 f"mail_operation_ttl_exceeded. thread_id={thread_id} "
@@ -210,7 +234,6 @@ class MailIncomingConsumer:
         elif final_state.phase == "error":
             destination = "error"
             agent_span.add_span_attributes(**{"aef.stop_event": "phase_error"})
-            return {"destination": destination}
 
         # Сборка reply (логика, ранее жившая в mail_app._enqueue_reply).
         # db_app публикует поле `author_email`, in-memory stub из mail_app —
@@ -243,6 +266,7 @@ class MailIncomingConsumer:
             in_reply_to=in_reply_to,
             thread_id=thread_id,
             cc=cc,
+            idempotency_key=f"agent-reply:{thread_id}:{message_id}" if message_id else None,
         )
 
         return {

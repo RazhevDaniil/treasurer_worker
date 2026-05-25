@@ -106,13 +106,21 @@ class ApproveTaskConsumer:
 
                 decision, reason = asyncio.run(self._process_task_async(task))
 
-                self._producer.send_result(
-                    task_id=task.task_id,
-                    calculation_id=task.calculation_id,
-                    decision=decision,
-                    reason=reason,
-                    agent_version=approve_version(),
-                )
+                try:
+                    self._producer.send_result(
+                        task_id=task.task_id,
+                        calculation_id=task.calculation_id,
+                        decision=decision,
+                        reason=reason,
+                        agent_version=approve_version(),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"approve_result_publish_failed. task_id={task.task_id} "
+                        f"calculation_id={task.calculation_id} error={exc}"
+                    )
+                    agent_span.add_span_attributes(**{"aef.stop_event": "result_publish_failed"})
+                    return
 
                 self._consumer.commit(message=msg)
                 agent_span.add_output_result(output={
@@ -121,13 +129,16 @@ class ApproveTaskConsumer:
                     "decision": decision,
                 })
 
+                if decision == "REJECTED":
+                    asyncio.run(self._notify_rejection_async(task, reason))
+
                 logger.info(
                     f"approve_task_processed. task_id={task.task_id} "
                     f"calculation_id={task.calculation_id} decision={decision}"
                 )
 
     async def _process_task_async(self, task: AgentTask) -> tuple[str, str]:
-        """Run approve + manager notification (on rejection) in a single async context.
+        """Run deterministic approve validation.
 
         `approve()` is deterministic validation + a single get_rate HTTP call —
         no LangGraph involvement, so no callbacks plumbing is needed; httpx
@@ -142,12 +153,13 @@ class ApproveTaskConsumer:
             )
             decision, reason = "REJECTED", f"Ошибка обработки: {exc}"
 
-        if decision == "REJECTED":
-            await self._notifier.notify_rejection(
-                task_id=task.task_id,
-                calculation_id=task.calculation_id,
-                parameters=task.parameters,
-                reason=reason,
-            )
-
         return decision, reason
+
+    async def _notify_rejection_async(self, task: AgentTask, reason: str) -> None:
+        """Best-effort notification after result publication succeeds."""
+        await self._notifier.notify_rejection(
+            task_id=task.task_id,
+            calculation_id=task.calculation_id,
+            parameters=task.parameters,
+            reason=reason,
+        )

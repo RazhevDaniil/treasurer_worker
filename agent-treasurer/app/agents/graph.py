@@ -104,6 +104,7 @@ async def process_message(
     checkpointer: MemorySaver | None = None,
     thread_id: str | None = None,
     counterparty_id: str | None = None,
+    incoming_message_id: str | None = None,
     callbacks: list[BaseCallbackHandler] | None = None,
 ) -> AgentState:
     """Process an incoming message through the deal agent graph.
@@ -120,6 +121,7 @@ async def process_message(
 
     initial_state = AgentState(
         incoming_message=message,
+        incoming_message_id=incoming_message_id,
         deals=[],
         is_new_thread=True,
     )
@@ -151,6 +153,7 @@ async def resume_with_message(
     message: str,
     thread_id: str,
     checkpointer: MemorySaver,
+    incoming_message_id: str | None = None,
     callbacks: list[BaseCallbackHandler] | None = None,
 ) -> AgentState:
     """Resume interrupted graph with a new message (counterparty reply).
@@ -180,6 +183,7 @@ async def resume_with_message(
 
     update = {
         "incoming_message": message,
+        "incoming_message_id": incoming_message_id,
         "awaiting_reply": False,
         "response_message": None,
         "response_sent": False,
