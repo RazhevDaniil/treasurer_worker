@@ -656,7 +656,7 @@ class DealConditions(BaseModel):
         and adjusted conditions instead of raising exceptions.
         Limits are read from settings (agent_treasurer_app/app/core/config.py).
         """
-        from agent_treasurer_app.app.core.config import settings as s
+        from ..core.config import settings as s
 
         result = ValidationResult()
         term = self.term_days

@@ -17,6 +17,7 @@ import httpx
 
 from .config import settings
 from .llm import get_llm
+from .tracing import bind_x_trace_id, trace_header_dict
 from ..models.schemas import DealConditions
 from ..services.deal_service import DealService
 
@@ -52,7 +53,10 @@ async def _check_gigachat() -> None:
 async def _check_mail_app() -> None:
     """Probe mail_app liveness."""
     async with httpx.AsyncClient(timeout=settings.readiness_mail_timeout_sec) as client:
-        resp = await client.get(f"{settings.mail_server_api_url}/health/live")
+        resp = await client.get(
+            f"{settings.mail_server_api_url}/health/live",
+            headers=trace_header_dict(),
+        )
         resp.raise_for_status()
 
 
@@ -101,6 +105,7 @@ async def run_checks(*, source: str) -> tuple[bool, list[dict]]:
     logs so operators can tell boot probes from background refreshes."""
     global _is_ready, _failures
 
+    bind_x_trace_id()
     failures: list[dict] = []
     for name, fn in CHECKS:
         try:

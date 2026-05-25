@@ -191,6 +191,7 @@ async def resume_with_message(
         "warnings": [],
         "last_error": None,
         "error_diagnostics": None,
+        "stop_event": None,
         "is_new_thread": False,
         "deal_results": None,
     }

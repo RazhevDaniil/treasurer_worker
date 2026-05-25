@@ -51,8 +51,15 @@ class Settings(BaseSettings):
     preview_model: Optional[str] = Field(default=None)
     preview_ratio: float = Field(
         default=0.0,
-        description="Probability in [0.0, 1.0] of routing each LLM call to the PreView model.",
+        description="Probability in [0.0, 0.05] of routing each LLM call to the PreView model.",
     )
+
+    @field_validator("preview_ratio")
+    @classmethod
+    def validate_preview_ratio(cls, v: float) -> float:
+        if not 0.0 <= v <= 0.05:
+            raise ValueError("preview_ratio must be between 0.0 and 0.05 (up to 5% load)")
+        return v
 
     timeout: int=300
     max_tokens: int=10000

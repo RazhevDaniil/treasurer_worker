@@ -3,7 +3,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel
@@ -14,9 +14,11 @@ from .core.config import settings
 from .core.tracing import (
     aef_agent_start,
     aef_input_request,
+    bind_x_trace_id,
     get_aef_handler,
     init_tracing,
     session_id_cvar,
+    trace_header_dict,
 )
 from .services.kafka_consumer import ApproveTaskConsumer
 from .services.kafka_producer import AgentResultProducer
@@ -136,17 +138,23 @@ def _chat_input_body(req: ChatRequest) -> dict:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, request: Request) -> ChatResponse:
+async def chat(req: ChatRequest, request: Request, response: Response) -> ChatResponse:
     """Process a user message through the deal agent graph.
 
-    SDK identifiers (trace_id, span_id, agent_uid) are produced inside the
-    AEF context managers; cross-service header propagation is gone."""
+    `x-trace-id` is the stable cross-service UID for the whole operation.
+    If the caller did not pass a valid UUID v4, the agent creates one and
+    returns it in the response header."""
+    x_trace_id = bind_x_trace_id(headers=request.headers)
+    response.headers["x-trace-id"] = x_trace_id
     session_id_cvar.set(req.chat_id)
-    logger.info(f"chat_request. chat_id={req.chat_id} message={req.message[:120]!r}")
+    logger.info(
+        f"chat_request. chat_id={req.chat_id} x_trace_id={x_trace_id} "
+        f"message={req.message[:120]!r}"
+    )
 
     with aef_input_request(
         span_name="chat",
-        headers=dict(request.headers),
+        headers=trace_header_dict(dict(request.headers)),
         body=_chat_input_body(req),
         path="/chat",
         method="POST",
@@ -158,6 +166,7 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
                 "aef.ttl": settings.operation_ttl_sec,
                 "aef.hops": None,
                 "aef.stop_event": None,
+                "aef.x_trace_id": x_trace_id,
             })
 
             response = await _dispatch_chat(req, agent_span)
@@ -165,7 +174,7 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
             agent_span.add_output_result(output=response.model_dump())
 
         input_req.add_response(
-            headers={},
+            headers=trace_header_dict(),
             body=response.model_dump(),
             http_code=200,
         )
@@ -223,7 +232,9 @@ async def _dispatch_chat(req: ChatRequest, agent_span) -> ChatResponse:
         )
     elif final_state.phase == "error":
         destination = "error"
-        agent_span.add_span_attributes(**{"aef.stop_event": "phase_error"})
+        agent_span.add_span_attributes(**{
+            "aef.stop_event": final_state.stop_event or "phase_error"
+        })
 
     logger.info(
         f"chat_response. chat_id={req.chat_id} destination={destination} "

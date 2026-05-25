@@ -18,7 +18,7 @@ from tenacity import (
 from typing import Optional
 
 from ..core.config import settings
-from ..core.tracing import aef_custom_span
+from ..core.tracing import aef_custom_span, trace_header_dict
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +83,6 @@ class EmailService:
         mail_app will generate a fresh Message-ID. Pass `cc` to put extra
         addresses in the Cc header (used by escalation: manager в To, клиент в Cc).
         """
-        client = await self._get_client()
-
         payload = {
             "recipient_email": to,
             "subject": subject,
@@ -119,7 +117,7 @@ class EmailService:
                             response = await client.post(
                                 "/api/v1/send_reply",
                                 json=payload,
-                                headers={"X-Account-ID": self.account_id},
+                                headers=trace_header_dict({"X-Account-ID": self.account_id}),
                             )
                             if _retryable_status(response.status_code):
                                 response.raise_for_status()
@@ -173,7 +171,7 @@ class EmailService:
                                 "limit": limit,
                                 "unread_only": True,
                             },
-                            headers={"X-Account-ID": self.account_id},
+                            headers=trace_header_dict({"X-Account-ID": self.account_id}),
                         )
                         if _retryable_status(response.status_code):
                             response.raise_for_status()
@@ -227,7 +225,7 @@ class EmailService:
                                     "folder": folder,
                                     "uids": message_uids,
                                 },
-                                headers={"X-Account-ID": self.account_id},
+                                headers=trace_header_dict({"X-Account-ID": self.account_id}),
                             )
                             if _retryable_status(response.status_code):
                                 response.raise_for_status()

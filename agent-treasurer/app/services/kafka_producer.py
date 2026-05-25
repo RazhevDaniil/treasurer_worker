@@ -8,7 +8,7 @@ import logging
 from confluent_kafka import KafkaException, Producer
 
 from ..core.config import settings
-from ..core.tracing import aef_kafka_produce
+from ..core.tracing import aef_kafka_produce, kafka_trace_headers
 from ..models.approve_schemas import AgentDecision, AgentResult
 
 logger = logging.getLogger(__name__)
@@ -57,13 +57,14 @@ class AgentResultProducer:
             processed_at=datetime.now(timezone.utc).isoformat(),
         )
         body = json.dumps(result.model_dump()).encode("utf-8")
+        headers = kafka_trace_headers()
 
         # SECURITY §20 — `kafka_produce` span for confluent-kafka (not in the
         # auto-instrumented aiokafka list). is_mutation/rollback_possible mark
         # the publish as a mutating action without a downstream rollback path.
         with aef_kafka_produce(
             span_name="produce_agent_result",
-            headers={},
+            headers=dict(headers),
             body=body,
             topic=settings.kafka_in_topic,
             kafka_cluster=settings.kafka_cluster_name,
@@ -72,15 +73,16 @@ class AgentResultProducer:
             kafka_span.add_span_attributes(**{
                 "aef.is_mutation": True,
                 "aef.rollback_possible": False,
+                "aef.x_trace_id": dict(headers).get("x-trace-id", b"").decode("utf-8"),
             })
-            self._produce_sync(task_id=task_id, body=body)
+            self._produce_sync(task_id=task_id, body=body, headers=headers)
 
             logger.info(
                 f"approve_result_sent. task_id={task_id} "
                 f"calculation_id={calculation_id} decision={decision}"
             )
 
-    def _produce_sync(self, *, task_id: str, body: bytes) -> None:
+    def _produce_sync(self, *, task_id: str, body: bytes, headers: list[tuple[str, bytes]]) -> None:
         delivery_event = threading.Event()
         delivery_error: list[KafkaException] = []
 
@@ -103,6 +105,7 @@ class AgentResultProducer:
                 topic=settings.kafka_in_topic,
                 key=task_id.encode("utf-8"),
                 value=body,
+                headers=headers,
                 callback=_on_delivery,
             )
         except (BufferError, KafkaException) as exc:

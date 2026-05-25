@@ -26,6 +26,11 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
+GIGAPLATFORM_STOP_MESSAGE = (
+    "The service is temporarily unavailable due to technical reasons."
+)
+GIGAPLATFORM_STOP_EVENT = "gigaplatform_stop_event"
+
 
 # Retry only transient categories — 429, 5xx, timeout, transport.
 # Validation / 4xx-non-429 / programming errors fall straight through to the
@@ -38,14 +43,47 @@ _RETRYABLE_EVENTS = {
 }
 
 
-def classify_gigachat_error(exc: BaseException) -> str:
-    """Map a GigaChat / transport exception to a §23 audit event name."""
+def _status_code(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
     if status is None:
         response = getattr(exc, "response", None)
         if response is not None:
             status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
 
+
+def _exception_text(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    parts = [str(exc)]
+    if response is not None:
+        for attr in ("text", "content"):
+            value = getattr(response, attr, None)
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+            parts.append(str(value))
+        try:
+            parts.append(str(response.json()))
+        except Exception:
+            pass
+    return " ".join(parts)
+
+
+def is_gigaplatform_stop_event(exc: BaseException) -> bool:
+    """True when GigaPlatform deliberately blocks this agent traffic class."""
+    return _status_code(exc) == 403 and GIGAPLATFORM_STOP_MESSAGE in _exception_text(exc)
+
+
+def classify_gigachat_error(exc: BaseException) -> str:
+    """Map a GigaChat / transport exception to a §23 audit event name."""
+    status = _status_code(exc)
+
+    if is_gigaplatform_stop_event(exc):
+        return GIGAPLATFORM_STOP_EVENT
     if status == 429:
         return "gigachat_rate_limited"
     if isinstance(status, int) and 500 <= status < 600:

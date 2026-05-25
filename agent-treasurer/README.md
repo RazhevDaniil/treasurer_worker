@@ -122,22 +122,23 @@ Resume flow:
 | ID | Жизненный цикл | Источник |
 | --- | --- | --- |
 | `trace_id` / `span_id` / `parent_span_id` | Один проход графа (= обработка одного входящего письма). Иерархия спанов выстраивается через nesting контекстных менеджеров. | AEF SDK генерирует автоматически на каждом `aef_input_request` / `aef_kafka_consume`. |
+| `x-trace-id` | Сквозной UUID v4 основной бизнес-операции. Принимается из входящих HTTP/Kafka headers; если отсутствует или не UUID v4 — агент генерирует новый. | [app/core/tracing.py](app/core/tracing.py) хранит UID в contextvar и прокидывает его в HTTP headers / Kafka headers. |
 | `session_id` | Стабильный за всю переписку (= `chat_id` для `/chat`, `task_id` для Kafka). | [app/app.py](app/app.py) / [app/services/kafka_consumer.py](app/services/kafka_consumer.py) — `session_id_cvar.set(...)` перед созданием span'ов. |
 | `agent-id` / `cluster-id` / `namespace` / `distributive` | Статически на каждый span-batch. | Kafka-headers `AEFKafkaSender(headers={...})` из настроек [app/core/config.py](app/core/config.py). |
 
 **Что эмитится в трейс:**
 
-- **`input_request "chat"`** + вложенный **`agent_start`** — обёртка `/chat` в [app/app.py](app/app.py). На `agent_start` спане проставлены `aef.agent_uid`, `aef.ttl`, `aef.hops`, `aef.stop_event`, `aef.session_id` (§21).
+- **`input_request "chat"`** + вложенный **`agent_start`** — обёртка `/chat` в [app/app.py](app/app.py). На `agent_start` спане проставлены `aef.agent_uid`, `aef.ttl`, `aef.hops`, `aef.stop_event`, `aef.session_id`, `aef.x_trace_id` (§21).
 - **`chain` / `llm` / `retriever` / `tool`** — автоматически через `AEFHandler` callback, передаваемый в `graph.ainvoke(config={"callbacks": [...]})` ([app/agents/graph.py](app/agents/graph.py)).
 - **`output_request`** — автоматически через OpenTelemetry instrumenting на httpx для вызовов `agent_tools_app.get_rate` ([app/services/deal_service.py](app/services/deal_service.py)) и `mail_app.send_reply` ([app/services/email_service.py](app/services/email_service.py)).
 - **`kafka_produce "produce_agent_result"`** и **`kafka_consume "consume_agent_task"`** — ручные обёртки в [app/services/kafka_producer.py](app/services/kafka_producer.py) / [app/services/kafka_consumer.py](app/services/kafka_consumer.py) (confluent-kafka не входит в auto-instrumented список SDK).
 - **`aef.is_mutation` / `aef.rollback_possible`** — атрибуты на спанах мутирующих действий: `kafka_produce`, `mail_app.send_reply` / `mail_app.mark_read` ([app/services/email_service.py](app/services/email_service.py) через `aef_custom_span`).
 
-**StopEvent (§21).** При TTL `asyncio.wait_for(timeout=settings.operation_ttl_sec)` на `agent_start` проставляется `aef.stop_event="ttl_exceeded"`; при `phase="error"` от графа — `"phase_error"`; в обоих случаях возвращается контролируемый ответ.
+**StopEvent (§21).** При TTL `asyncio.wait_for(timeout=settings.operation_ttl_sec)` на `agent_start` проставляется `aef.stop_event="ttl_exceeded"`; при `phase="error"` от графа — `"phase_error"`; при отказе GigaPlatform `403` с сообщением `The service is temporarily unavailable due to technical reasons.` — `"gigaplatform_stop_event"`. Во всех случаях возвращается контролируемый ответ.
 
-**PreView GigaChat (§26).** `_pick_model()` в [app/core/llm.py](app/core/llm.py) per-call выбирает Main или PreView; на каждом свежем `GigaChat(...)` подвешен `callbacks=[get_aef_handler()]` — SDK собирает `llm` span с фактической `model`. Выбор дополнительно логируется через stdlib `logging` (`gigachat_installation_picked. installation=... model=...`).
+**PreView GigaChat (§26).** `_pick_model()` в [app/core/llm.py](app/core/llm.py) per-call выбирает Main или PreView; `preview_ratio` валидируется как диапазон `0.0..0.05` (до 5% нагрузки). На каждом свежем `GigaChat(...)` подвешен `callbacks=[get_aef_handler()]` — SDK собирает `llm` span с фактической `model`. Выбор дополнительно логируется через stdlib `logging` (`gigachat_installation_picked. installation=... model=...`).
 
-Cross-service trace propagation (`X-Run-Id` / `X-Thread-Id` headers) удалена — `mail_app`/`approve_app` больше не передают свои ID. SDK генерирует `trace_id` сам.
+Cross-service propagation выполняется через `x-trace-id`: `/chat` возвращает его в response headers, HTTP-клиенты передают его в `agent_tools_app` / `mail_app`, Kafka producer публикует его в message headers.
 
 ---
 
@@ -157,6 +158,7 @@ Cross-service trace propagation (`X-Run-Id` / `X-Thread-Id` headers) удале�
 | --- | --- | --- |
 | HTTP 429 | `gigachat_rate_limited` | да |
 | HTTP 5xx | `gigachat_5xx_failed` | да |
+| HTTP 403 + GigaPlatform stop message | `gigaplatform_stop_event` | нет |
 | `httpx.TimeoutException` / `asyncio.TimeoutError` | `gigachat_timeout` | да |
 | `httpx.ConnectError` / `RemoteProtocolError` / `OSError` | `gigachat_transport_error` | да |
 | HTTP 4xx (не 429) | `gigachat_response_error` | нет |

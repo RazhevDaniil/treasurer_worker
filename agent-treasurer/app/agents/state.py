@@ -143,6 +143,11 @@ class AgentState(BaseModel):
         description="Machine-facing details for fatal errors"
     )
 
+    stop_event: Optional[str] = Field(
+        None,
+        description="StopEvent that terminated the current operation, if any"
+    )
+
     # === Interrupt State ===
     awaiting_reply: bool = Field(
         False,

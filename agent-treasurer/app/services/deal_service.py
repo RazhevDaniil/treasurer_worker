@@ -13,6 +13,7 @@ from tenacity import (
 )
 
 from ..core.config import settings
+from ..core.tracing import trace_header_dict
 from ..models.schemas import Deal, DealConditions, RateError
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ class DealService:
                         response = await client.post(
                             f"{settings.tool_api_url}/api/get_rate",
                             json=payload,
+                            headers=trace_header_dict(),
                         )
                         # Retry only on transport-level recoverable statuses;
                         # 4xx (except 429) flows to the business-error branch below.

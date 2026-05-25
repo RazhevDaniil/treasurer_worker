@@ -22,7 +22,9 @@ from ..core.config import settings
 from ..core.tracing import (
     aef_agent_start,
     aef_kafka_consume,
+    bind_x_trace_id,
     get_aef_handler,
+    kafka_trace_headers,
     session_id_cvar,
 )
 from .email_service import EmailService
@@ -100,10 +102,12 @@ class MailIncomingConsumer:
         # thread_id = LangGraph chat_id = AEF session_id (общий ключ корреляции
         # на всём цикле переговоров по треду).
         session_id_cvar.set(thread_id)
+        x_trace_id = bind_x_trace_id(headers=msg.headers() or [])
+        trace_headers = kafka_trace_headers(msg.headers() or [])
 
         with aef_kafka_consume(
             span_name="consume_mail_incoming",
-            headers=dict(msg.headers() or []),
+            headers=dict(trace_headers),
             body=msg.value(),
             topic=settings.kafka_mail_topic,
             kafka_cluster=settings.kafka_cluster_name,
@@ -114,6 +118,7 @@ class MailIncomingConsumer:
                 "thread_id": thread_id,
                 "message_id": message_id,
                 "message_len": len(message_text),
+                "x_trace_id": x_trace_id,
             }) as agent_span:
                 agent_span.add_span_attributes(**{
                     "aef.agent_uid": settings.aef_agent_id,
@@ -121,11 +126,12 @@ class MailIncomingConsumer:
                     "aef.ttl": settings.operation_ttl_sec,
                     "aef.hops": None,
                     "aef.stop_event": None,
+                    "aef.x_trace_id": x_trace_id,
                 })
 
                 logger.info(
                     f"mail_message_received. thread_id={thread_id} "
-                    f"message_id={message_id}"
+                    f"message_id={message_id} x_trace_id={x_trace_id}"
                 )
 
                 try:
@@ -215,25 +221,29 @@ class MailIncomingConsumer:
                 f"ttl_sec={settings.operation_ttl_sec}"
             )
             agent_span.add_span_attributes(**{"aef.stop_event": "ttl_exceeded"})
-            return {"destination": "error", "reason": "ttl_exceeded"}
-
-        answer = final_state.response_message
-        if not answer:
-            logger.warning(f"mail_no_answer. thread_id={thread_id}")
-            agent_span.add_span_attributes(**{"aef.stop_event": "no_answer"})
-            return {"destination": "error", "reason": "no_answer"}
-
-        destination = "agent"
-        manager_email: str | None = None
-        if final_state.escalation_requested:
-            destination = "escalation"
-            manager_email = next(
-                (d.assigned_employee for d in final_state.deals if d.assigned_employee),
-                settings.default_employee_email,
-            )
-        elif final_state.phase == "error":
+            answer = settings.operation_ttl_user_message
             destination = "error"
-            agent_span.add_span_attributes(**{"aef.stop_event": "phase_error"})
+            manager_email: str | None = None
+        else:
+            answer = final_state.response_message
+            if not answer:
+                logger.warning(f"mail_no_answer. thread_id={thread_id}")
+                agent_span.add_span_attributes(**{"aef.stop_event": "no_answer"})
+                return {"destination": "error", "reason": "no_answer"}
+
+            destination = "agent"
+            manager_email: str | None = None
+            if final_state.escalation_requested:
+                destination = "escalation"
+                manager_email = next(
+                    (d.assigned_employee for d in final_state.deals if d.assigned_employee),
+                    settings.default_employee_email,
+                )
+            elif final_state.phase == "error":
+                destination = "error"
+                agent_span.add_span_attributes(**{
+                    "aef.stop_event": final_state.stop_event or "phase_error"
+                })
 
         # Сборка reply (логика, ранее жившая в mail_app._enqueue_reply).
         # db_app публикует поле `author_email`, in-memory stub из mail_app —
