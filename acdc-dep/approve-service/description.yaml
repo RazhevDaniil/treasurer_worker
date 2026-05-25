@@ -1,0 +1,23 @@
+namespace: acdc-dep
+wrapper: 1.0.0.fastapi
+
+app:
+  author: Ражев Даниил Сергеевич
+  emails: 
+    - DSRazhev@sberbank.ru
+    - MAKolodyazhny@sberbank.ru
+  unit: УМиИД. Блок Финансов
+  description: Сервис согласования расчётов казначейством — Kafka-оркестратор между CSP, CalcFundCost, db_app и agent_treasurer_app
+  language: python
+  connections:
+    endpoints:
+      - alias: CALC_FUND_COST_URL
+        description: Base URL внешнего CalcFundCost API
+      - alias: DB_SERVICE_URL
+        description: Base URL сервиса db_app
+      - alias: ADAPTER_BROKERS
+        description: Хосты бизнесового Kafka-кластера (CSP, approve ↔ agent)
+      - alias: KAFKA_OUT_TOPIC
+        description: Исходящий топик — задания на согласование в agent_treasurer
+      - alias: KAFKA_IN_TOPIC
+        description: Входящий топик — результат согласования от agent_treasurer

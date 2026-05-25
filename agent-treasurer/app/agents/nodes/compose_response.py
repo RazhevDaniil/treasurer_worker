@@ -24,6 +24,11 @@ async def compose_response_node(state: AgentState) -> dict[str, Any]:
     # Early nodes hit phase="error" → generate user-facing error and keep phase
     if state.phase == "error":
         logger.warning(f"compose_response_error_phase. last_error={state.last_error}")
+        if state.stop_event == "gigaplatform_stop_event":
+            return {
+                "response_message": _gigaplatform_stop_response(),
+                "phase": "error",
+            }
         return {
             "response_message": _error_response(),
             "phase": "error",
@@ -87,5 +92,14 @@ def _error_response() -> str:
         "Добрый день!\n\n"
         "К сожалению, я не смог обработать ваш запрос.\n"
         "Пожалуйста, уточните условия сделки или обратитесь к уполномоченному сотруднику Казначейства\n\n"
+        "С уважением,\nкоманда Казначейства"
+    )
+
+
+def _gigaplatform_stop_response() -> str:
+    return (
+        "Добрый день!\n\n"
+        "Сервис GigaChat временно недоступен по техническим причинам. "
+        "Пожалуйста, попробуйте повторить запрос позже.\n\n"
         "С уважением,\nкоманда Казначейства"
     )

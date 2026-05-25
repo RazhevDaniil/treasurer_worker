@@ -1,0 +1,30 @@
+namespace: acdc-dep
+wrapper: 1.0.0.fastapi
+
+app:
+  author: Ражев Даниил Сергеевич
+  emails: 
+    - DSRazhev@sberbank.ru
+    - MAKolodyazhny@sberbank.ru
+  unit: УМиИД. Блок Финансов
+  description: Сервис почтового шлюза — приём писем по IMAP и отправка по SMTP
+  language: python
+  note: Все настройки захардкожены в app/config.py
+  connections: # Альясы для открытия исходящего доступа к ресурсам (опционально)
+    endpoints: # Список альясов хостов доступа по REST API 0..N (опционально), в коде можно получить как os.getenv('имя')
+      - alias: AGENT_URL
+        description: URL адрес агента (legacy HTTP /chat — UI/тесты; основной поток ушёл в Kafka)
+      - alias: MAIL_SMTP_HOST
+        description: Хост для smtp почтового сервера
+      - alias: MAIL_IMAP_HOST
+        description: Хост для imap почтового сервера
+      - alias: DB_URL
+        description: URL адрес сервиса по работе с БД
+      - alias: ADAPTER_BROKERS
+        description: Хосты бизнесового Kafka-кластера (mail → agent)
+      - alias: KAFKA_MAIL_TOPIC
+        description: Исходящий топик — письма-переговоры в agent_treasurer
+  secretFiles:
+    - alias: postServiceCreds
+      fileName: postservicecreds.properties # имя файла с логином и паролем
+      description: Логин и пароль от ТУЗа

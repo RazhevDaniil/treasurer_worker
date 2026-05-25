@@ -65,7 +65,10 @@ class ApproveNotifier:
         email_service = EmailService()
         try:
             sent = await email_service.send_email(
-                to=self._recipient, subject=subject, body=body
+                to=self._recipient,
+                subject=subject,
+                body=body,
+                idempotency_key=f"approve-rejection:{task_id}",
             )
         except Exception as exc:
             logger.error(

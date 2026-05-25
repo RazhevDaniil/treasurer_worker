@@ -19,7 +19,13 @@ from langchain_core.runnables import RunnableConfig
 from ..state import AgentState
 from ...core.config import settings
 from ...core.llm import get_llm_with_config
-from ...core.llm_retry import llm_retrying_async, log_llm_exhausted
+from ...core.llm_retry import (
+    GIGAPLATFORM_STOP_EVENT,
+    is_gigaplatform_stop_event,
+    llm_ainvoke_with_retry,
+    log_llm_exhausted,
+)
+from ...core.tracing import safe_trace_json, trace_action_span
 from ...models.schemas import (
     Deal,
     DealConditions,
@@ -326,13 +332,37 @@ async def _extract_deal_conditions(message_text: str) -> DealConditions:
         SystemMessage(content=CONDITIONS_EXTRACTION_PROMPT),
         HumanMessage(content=message_text),
     ]
-    try:
-        async for attempt in llm_retrying_async():
-            with attempt:
-                result = await llm.ainvoke(messages)
-    except Exception as exc:
-        log_llm_exhausted(exc, purpose="extract_deal_conditions")
-        raise
+    with trace_action_span(
+        "llm.extract_deal_conditions",
+        call_type="llm_call",
+        target_name="GigaChat",
+        request_payload={
+            "purpose": "extract_deal_conditions",
+            "message_text": message_text,
+            "messages": [m.content for m in messages],
+        },
+        is_mutation=False,
+        rollback_possible=None,
+        extra_attrs={
+            "aef.llm_purpose": "extract_deal_conditions",
+        },
+    ) as span:
+        try:
+            result = await llm_ainvoke_with_retry(
+                llm,
+                messages,
+                purpose="extract_deal_conditions",
+                trace_span=span,
+            )
+        except Exception as exc:
+            if is_gigaplatform_stop_event(exc):
+                span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})
+            log_llm_exhausted(exc, purpose="extract_deal_conditions")
+            raise
+        span.add_span_attributes(**{
+            "aef.response_payload": safe_trace_json(result),
+        })
+        span.add_output_result(result)
     if result is None:
         logger.warning("extract_conditions_llm_returned_none")
         result_payload = {}
@@ -396,13 +426,38 @@ async def _extract_reply_update(
         HumanMessage(content=fragment.text),
     ]
 
-    try:
-        async for attempt in llm_retrying_async():
-            with attempt:
-                raw_update = await llm.ainvoke(messages)
-    except Exception as exc:
-        log_llm_exhausted(exc, purpose="extract_reply_update")
-        raise
+    with trace_action_span(
+        "llm.extract_reply_update",
+        call_type="llm_call",
+        target_name="GigaChat",
+        request_payload={
+            "purpose": "extract_reply_update",
+            "fragment": fragment,
+            "existing_deals": existing_deals,
+            "messages": [m.content for m in messages],
+        },
+        is_mutation=False,
+        rollback_possible=None,
+        extra_attrs={
+            "aef.llm_purpose": "extract_reply_update",
+        },
+    ) as span:
+        try:
+            raw_update = await llm_ainvoke_with_retry(
+                llm,
+                messages,
+                purpose="extract_reply_update",
+                trace_span=span,
+            )
+        except Exception as exc:
+            if is_gigaplatform_stop_event(exc):
+                span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})
+            log_llm_exhausted(exc, purpose="extract_reply_update")
+            raise
+        span.add_span_attributes(**{
+            "aef.response_payload": safe_trace_json(raw_update),
+        })
+        span.add_output_result(raw_update)
     if raw_update is None:
         logger.warning("extract_reply_update_llm_returned_none")
         update = _fallback_reply_update(fragment)
@@ -458,6 +513,15 @@ REQUIRED_DEAL_FIELDS: dict[str, str] = {
 }
 
 
+def _gigaplatform_stop_result(exc: BaseException) -> dict[str, Any]:
+    return {
+        "phase": "error",
+        "last_error": "GigaPlatform temporarily disabled GigaChat requests for this agent class",
+        "error_diagnostics": f"{type(exc).__name__}: {exc}",
+        "stop_event": GIGAPLATFORM_STOP_EVENT,
+    }
+
+
 def _apply_updates(
     existing_deals: list[Deal],
     deal_updates: list[DealUpdate],
@@ -496,6 +560,7 @@ def _apply_updates(
                 conditions=conditions,
                 status=DealStatus.NEGOTIATING,
                 deal_number=update.deal_number,
+                max_iterations=settings.max_negotiation_iterations,
             )
             deals_by_number[update.deal_number] = deal
 
@@ -561,6 +626,12 @@ async def parse_message_node(state: AgentState, config: RunnableConfig) -> dict[
                 conditions = await _extract_deal_conditions(fragment.text)
                 successful_extractions += 1
             except Exception as exc:
+                if is_gigaplatform_stop_event(exc):
+                    logger.error(
+                        f"gigaplatform_stop_event. fragment_index={i + 1} "
+                        f"exc_type={type(exc).__name__} exc={exc}"
+                    )
+                    return _gigaplatform_stop_result(exc)
                 logger.error(
                     f"extract_fragment_failed. fragment_index={i + 1} "
                     f"exc_type={type(exc).__name__} exc={exc}"
@@ -586,6 +657,13 @@ async def parse_message_node(state: AgentState, config: RunnableConfig) -> dict[
                 update = await _extract_reply_update(fragment, state.deals)
                 successful_extractions += 1
             except Exception as exc:
+                if is_gigaplatform_stop_event(exc):
+                    logger.error(
+                        f"gigaplatform_stop_event. fragment_index={i + 1} "
+                        f"deal_number_hint={fragment.deal_number_hint} "
+                        f"exc_type={type(exc).__name__} exc={exc}"
+                    )
+                    return _gigaplatform_stop_result(exc)
                 logger.error(
                     f"extract_reply_fragment_failed. fragment_index={i + 1} "
                     f"deal_number_hint={fragment.deal_number_hint} "

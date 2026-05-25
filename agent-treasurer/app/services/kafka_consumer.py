@@ -11,7 +11,21 @@ import logging
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
 from ..core.config import settings
-from ..core.tracing import aef_agent_start, aef_kafka_consume, session_id_cvar
+from ..core.tracing import (
+    aef_agent_start,
+    aef_kafka_consume,
+    bind_x_trace_id,
+    current_hops,
+    ensure_x_trace_id,
+    extract_x_trace_id,
+    kafka_trace_headers,
+    reset_hops,
+    safe_span_attributes,
+    safe_span_output,
+    safe_trace_json,
+    session_id_cvar,
+    trace_action_span,
+)
 from ..models.approve_schemas import AgentTask
 from .approve_notifier import ApproveNotifier
 from .approve_service import approve, approve_version
@@ -75,79 +89,176 @@ class ApproveTaskConsumer:
         # use it as the AEF session_id so all spans in the consume/agent_start
         # subtree share the same `attributes.aef.session_id`.
         session_id_cvar.set(task.task_id)
+        incoming_headers = msg.headers() or []
+        x_trace_id = (
+            extract_x_trace_id(incoming_headers)
+            or ensure_x_trace_id(task.x_trace_id or task.run_id or task.task_id)
+        )
+        bind_x_trace_id(x_trace_id)
+        reset_hops()
+        trace_headers = kafka_trace_headers(incoming_headers)
+        effective_ttl = max(0, min(settings.operation_ttl_sec, task.ttl_seconds))
+        agent_input = {**task.model_dump(), "x_trace_id": x_trace_id}
 
         # SECURITY §20 — `kafka_consume` span (confluent-kafka not auto-instrumented).
         # Wrap the agent execution in `agent_start` so contract params are visible.
         with aef_kafka_consume(
             span_name="consume_agent_task",
-            headers=dict(msg.headers() or []),
+            headers=dict(trace_headers),
             body=msg.value(),
             topic=settings.kafka_out_topic,
             kafka_cluster=settings.kafka_cluster_name,
             bootstrap_servers=settings.adapter_brokers.split(","),
             consumer_group=settings.kafka_group_id,
         ):
-            with aef_agent_start(input=task.model_dump()) as agent_span:
-                agent_span.add_span_attributes(**{
+            with aef_agent_start(input=agent_input) as agent_span:
+                safe_span_attributes(agent_span, **{
                     "aef.agent_uid": settings.aef_agent_id,
+                    "aef.agent_name": settings.aef_agent_id,
                     "aef.session_id": task.task_id,
-                    # Per-call hops / TTL / stop_event not enforced for the
-                    # approve path; they're recorded as null so auditors see
-                    # the contract slot is present and intentionally empty.
-                    "aef.hops": None,
-                    "aef.ttl": None,
+                    "aef.hops": settings.operation_max_hops,
+                    "aef.hops_used": current_hops(),
+                    "aef.ttl": effective_ttl,
                     "aef.stop_event": None,
+                    "aef.x_trace_id": x_trace_id,
+                    "aef.operation_uid": x_trace_id,
+                    "aef.parent_operation_uid": x_trace_id,
+                    "aef.executable_json": safe_trace_json(agent_input),
                 })
 
                 logger.info(
                     f"approve_task_received. task_id={task.task_id} "
-                    f"calculation_id={task.calculation_id}"
+                    f"calculation_id={task.calculation_id} "
+                    f"x_trace_id={x_trace_id} ttl_sec={effective_ttl}"
                 )
 
-                decision, reason = asyncio.run(self._process_task_async(task))
-
-                self._producer.send_result(
-                    task_id=task.task_id,
-                    calculation_id=task.calculation_id,
-                    decision=decision,
-                    reason=reason,
-                    agent_version=approve_version(),
+                decision, reason, stop_event = asyncio.run(
+                    self._process_task_async(task, effective_ttl)
                 )
+                if stop_event:
+                    safe_span_attributes(agent_span, **{"aef.stop_event": stop_event})
+
+                try:
+                    self._producer.send_result(
+                        task_id=task.task_id,
+                        calculation_id=task.calculation_id,
+                        decision=decision,
+                        reason=reason,
+                        agent_version=approve_version(),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"approve_result_publish_failed. task_id={task.task_id} "
+                        f"calculation_id={task.calculation_id} error={exc}"
+                    )
+                    safe_span_attributes(agent_span, **{
+                        "aef.stop_event": "result_publish_failed",
+                        "aef.hops_used": current_hops(),
+                    })
+                    return
 
                 self._consumer.commit(message=msg)
-                agent_span.add_output_result(output={
+                result_payload = {
                     "task_id": task.task_id,
                     "calculation_id": task.calculation_id,
                     "decision": decision,
+                    "reason": reason,
+                    "x_trace_id": x_trace_id,
+                }
+                safe_span_attributes(agent_span, **{
+                    "aef.hops_used": current_hops(),
+                    "aef.result_payload": safe_trace_json(result_payload),
                 })
+                safe_span_output(agent_span, result_payload)
+
+                if decision == "REJECTED":
+                    asyncio.run(self._notify_rejection_async(task, reason))
 
                 logger.info(
                     f"approve_task_processed. task_id={task.task_id} "
                     f"calculation_id={task.calculation_id} decision={decision}"
                 )
 
-    async def _process_task_async(self, task: AgentTask) -> tuple[str, str]:
-        """Run approve + manager notification (on rejection) in a single async context.
+    async def _process_task_async(
+        self,
+        task: AgentTask,
+        ttl_seconds: int,
+    ) -> tuple[str, str, str | None]:
+        """Run deterministic approve validation.
 
         `approve()` is deterministic validation + a single get_rate HTTP call —
         no LangGraph involvement, so no callbacks plumbing is needed; httpx
         auto-instrumentation captures the outgoing request span.
         """
-        try:
-            decision, reason = await approve(task.parameters)
-        except Exception as exc:
+        if ttl_seconds <= 0:
             logger.error(
-                f"approve_unexpected_error. task_id={task.task_id} "
-                f"calculation_id={task.calculation_id} error={exc}"
+                f"approve_ttl_exceeded_before_start. task_id={task.task_id} "
+                f"calculation_id={task.calculation_id} ttl_sec={ttl_seconds}"
             )
-            decision, reason = "REJECTED", f"Ошибка обработки: {exc}"
+            return "REJECTED", "Превышен TTL обработки approve-задачи.", "ttl_exceeded"
 
-        if decision == "REJECTED":
-            await self._notifier.notify_rejection(
-                task_id=task.task_id,
-                calculation_id=task.calculation_id,
-                parameters=task.parameters,
-                reason=reason,
+        with trace_action_span(
+            "approve.validate_business_rules",
+            call_type="action",
+            target_name="approve_service.approve",
+            request_payload={
+                "task_id": task.task_id,
+                "calculation_id": task.calculation_id,
+                "parameters": task.parameters,
+                "ttl_seconds": ttl_seconds,
+            },
+            is_mutation=False,
+            rollback_possible=None,
+            extra_attrs={
+                "aef.ttl": ttl_seconds,
+                "aef.stop_event": None,
+            },
+        ) as span:
+            try:
+                decision, reason = await asyncio.wait_for(
+                    approve(task.parameters),
+                    timeout=ttl_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"approve_ttl_exceeded. task_id={task.task_id} "
+                    f"calculation_id={task.calculation_id} ttl_sec={ttl_seconds}"
+                )
+                result = {
+                    "decision": "REJECTED",
+                    "reason": "Превышен TTL обработки approve-задачи.",
+                    "stop_event": "ttl_exceeded",
+                }
+                span.add_span_attributes(**{
+                    "aef.stop_event": "ttl_exceeded",
+                    "aef.result_payload": safe_trace_json(result),
+                })
+                span.add_output_result(result)
+                return "REJECTED", "Превышен TTL обработки approve-задачи.", "ttl_exceeded"
+            except Exception as exc:
+                logger.error(
+                    f"approve_unexpected_error. task_id={task.task_id} "
+                    f"calculation_id={task.calculation_id} error={exc}"
+                )
+                decision, reason = "REJECTED", f"Ошибка обработки: {exc}"
+
+            result = {
+                "decision": decision,
+                "reason": reason,
+                "stop_event": None,
+            }
+            span.add_span_attributes(
+                **{"aef.result_payload": safe_trace_json(result)}
             )
+            span.add_output_result(result)
 
-        return decision, reason
+        return decision, reason, None
+
+    async def _notify_rejection_async(self, task: AgentTask, reason: str) -> None:
+        """Best-effort notification after result publication succeeds."""
+        await self._notifier.notify_rejection(
+            task_id=task.task_id,
+            calculation_id=task.calculation_id,
+            parameters=task.parameters,
+            reason=reason,
+        )

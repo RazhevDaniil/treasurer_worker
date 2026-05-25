@@ -16,7 +16,7 @@ from functools import lru_cache
 from langchain_gigachat.chat_models import GigaChat
 
 from .config import settings
-from .tracing import get_aef_handler
+from .tracing import current_x_trace_id, get_aef_handler
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ def _gigachat_kwargs() -> dict:
         cert_file=settings.cert_file,
         key_file=settings.key_file,
         callbacks=[get_aef_handler()],
+        metadata={"x_trace_id": current_x_trace_id()},
     )
 
 

@@ -14,6 +14,7 @@ from langchain_core.runnables import RunnableConfig
 
 from .parse_message import REQUIRED_DEAL_FIELDS, _merge_conditions
 from ..state import AgentState
+from ...core.tracing import safe_trace_json, trace_action_span
 from ...models.schemas import (
     Deal,
     DealConditions,
@@ -27,6 +28,43 @@ from ...models.schemas import (
 from ...services.deal_service import DealService
 
 logger = logging.getLogger(__name__)
+
+
+def _deal_action_payload(deal: Deal, update: DealUpdate | None, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "deal": deal,
+        "update": update,
+    }
+    payload.update(extra)
+    return payload
+
+
+async def _trace_deal_result(
+    action_name: str,
+    request_payload: dict[str, Any],
+    coro,
+    *,
+    rollback_possible: bool = True,
+) -> DealResult:
+    with trace_action_span(
+        f"deal.{action_name}",
+        call_type="action",
+        target_name="deal_processor",
+        request_payload=request_payload,
+        is_mutation=True,
+        rollback_possible=rollback_possible,
+    ) as span:
+        result = await coro
+        result_payload = {
+            "deal": result.deal,
+            "response_section": result.response_section,
+        }
+        span.add_span_attributes(**{
+            "aef.response_payload": safe_trace_json(result_payload),
+            "aef.result_payload": safe_trace_json(result_payload),
+        })
+        span.add_output_result(result_payload)
+        return result
 
 
 def _build_offer_text(
@@ -108,7 +146,7 @@ async def _handle_new_deal(
     return await _negotiate_deal(deal, update, suggestions)
 
 
-async def _negotiate_deal(
+async def _negotiate_deal_impl(
     deal: Deal,
     update: DealUpdate,
     suggestions: list[str] | None = None,
@@ -275,7 +313,19 @@ async def _negotiate_deal(
     return DealResult(deal=deal, response_section=response_section)
 
 
-async def _accept_deal(deal: Deal, update: DealUpdate) -> DealResult:
+async def _negotiate_deal(
+    deal: Deal,
+    update: DealUpdate,
+    suggestions: list[str] | None = None,
+) -> DealResult:
+    return await _trace_deal_result(
+        "negotiate",
+        _deal_action_payload(deal, update, suggestions=suggestions),
+        _negotiate_deal_impl(deal, update, suggestions),
+    )
+
+
+async def _accept_deal_impl(deal: Deal, update: DealUpdate) -> DealResult:
     """Handle client agreement — validate rate against ladder, then respond with deal link."""
     # If conditions changed or rate ladder was never fetched — re-negotiate
     if update.conditions is not None or not deal.rate_ladder:
@@ -315,7 +365,15 @@ async def _accept_deal(deal: Deal, update: DealUpdate) -> DealResult:
     )
 
 
-async def _escalate_deal(
+async def _accept_deal(deal: Deal, update: DealUpdate) -> DealResult:
+    return await _trace_deal_result(
+        "accept",
+        _deal_action_payload(deal, update),
+        _accept_deal_impl(deal, update),
+    )
+
+
+async def _escalate_deal_impl(
     deal: Deal, reason: str, *, ladder_exhausted: bool = False,
 ) -> DealResult:
     """Escalate deal to human employee."""
@@ -349,7 +407,18 @@ async def _escalate_deal(
     return DealResult(deal=deal, response_section=response)
 
 
-async def _provide_data(
+async def _escalate_deal(
+    deal: Deal, reason: str, *, ladder_exhausted: bool = False,
+) -> DealResult:
+    return await _trace_deal_result(
+        "escalate",
+        _deal_action_payload(deal, None, reason=reason, ladder_exhausted=ladder_exhausted),
+        _escalate_deal_impl(deal, reason, ladder_exhausted=ladder_exhausted),
+        rollback_possible=False,
+    )
+
+
+async def _provide_data_impl(
     deal: Deal,
     update: DealUpdate,
     suggestions: list[str] | None = None,
@@ -378,6 +447,18 @@ async def _provide_data(
     logger.debug(f"provide_data_complete_proceeding_to_negotiate. deal_number={deal.deal_number}")
     # All fields present — generate offer
     return await _negotiate_deal(deal, update, suggestions)
+
+
+async def _provide_data(
+    deal: Deal,
+    update: DealUpdate,
+    suggestions: list[str] | None = None,
+) -> DealResult:
+    return await _trace_deal_result(
+        "provide_data",
+        _deal_action_payload(deal, update, suggestions=suggestions),
+        _provide_data_impl(deal, update, suggestions),
+    )
 
 
 # ============================================================================

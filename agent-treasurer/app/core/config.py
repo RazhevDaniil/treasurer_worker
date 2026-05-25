@@ -51,8 +51,15 @@ class Settings(BaseSettings):
     preview_model: Optional[str] = Field(default=None)
     preview_ratio: float = Field(
         default=0.0,
-        description="Probability in [0.0, 1.0] of routing each LLM call to the PreView model.",
+        description="Probability in [0.0, 0.05] of routing each LLM call to the PreView model.",
     )
+
+    @field_validator("preview_ratio")
+    @classmethod
+    def validate_preview_ratio(cls, v: float) -> float:
+        if not 0.0 <= v <= 0.05:
+            raise ValueError("preview_ratio must be between 0.0 and 0.05 (up to 5% load)")
+        return v
 
     timeout: int=300
     max_tokens: int=10000
@@ -64,6 +71,14 @@ class Settings(BaseSettings):
     llm_retry_max: float = Field(
         default=5.0,
         description="Maximum backoff in seconds for exponential-jitter wait between LLM retries (SECURITY §22/§23).",
+    )
+    llm_retry_exp_base: float = Field(
+        default=2.0,
+        description="Exponential base/multiplier for LLM retry backoff.",
+    )
+    llm_retry_jitter: float = Field(
+        default=1.0,
+        description="Max random jitter in seconds added to LLM retry backoff.",
     )
     profanity_check: bool=False
     verify_ssl_certs: bool=False
@@ -151,6 +166,10 @@ class Settings(BaseSettings):
     operation_ttl_user_message: str = Field(
         default="Извините, ответ агента занимает слишком много времени. Пожалуйста, попробуйте написать ещё раз.",
         description="User-facing message returned when operation_ttl_sec is exceeded.",
+    )
+    operation_max_hops: int = Field(
+        default=20,
+        description="Maximum external calls/attempts recorded as hops for one agent operation.",
     )
 
     # === Per-currency limits: RUB FIX ===
@@ -269,6 +288,14 @@ class Settings(BaseSettings):
         default=5.0,
         description="Maximum backoff in seconds for exponential-jitter wait between HTTP retries.",
     )
+    http_retry_exp_base: float = Field(
+        default=2.0,
+        description="Exponential base/multiplier for outbound HTTP retry backoff.",
+    )
+    http_retry_jitter: float = Field(
+        default=1.0,
+        description="Max random jitter in seconds added to outbound HTTP retry backoff.",
+    )
 
     # === Kafka producer retry (SECURITY §22) ===
     kafka_producer_retries: int = Field(
@@ -320,6 +347,11 @@ class Settings(BaseSettings):
         default=10_485_760,
         validation_alias="AEF_KAFKA_MAX_REQUEST_SIZE",
         description="max_request_size (bytes) for the AEF Controller Kafka producer. 10 MB by default.",
+    )
+    tracing_max_payload_size: int = Field(
+        default=10_000,
+        validation_alias="TRACING_MAX_PAYLOAD_SIZE",
+        description="Maximum serialized request/response payload size stored in trace attributes.",
     )
     aef_agent_id: str = Field(
         default="prototype-treasurer",

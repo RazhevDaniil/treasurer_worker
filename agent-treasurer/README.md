@@ -122,47 +122,52 @@ Resume flow:
 | ID | Жизненный цикл | Источник |
 | --- | --- | --- |
 | `trace_id` / `span_id` / `parent_span_id` | Один проход графа (= обработка одного входящего письма). Иерархия спанов выстраивается через nesting контекстных менеджеров. | AEF SDK генерирует автоматически на каждом `aef_input_request` / `aef_kafka_consume`. |
+| `x-trace-id` | Сквозной UUID v4 основной бизнес-операции. Принимается из входящих HTTP/Kafka headers; если отсутствует или не UUID v4 — агент генерирует новый. | [app/core/tracing.py](app/core/tracing.py) хранит UID в contextvar и прокидывает его в HTTP headers / Kafka headers. |
 | `session_id` | Стабильный за всю переписку (= `chat_id` для `/chat`, `task_id` для Kafka). | [app/app.py](app/app.py) / [app/services/kafka_consumer.py](app/services/kafka_consumer.py) — `session_id_cvar.set(...)` перед созданием span'ов. |
 | `agent-id` / `cluster-id` / `namespace` / `distributive` | Статически на каждый span-batch. | Kafka-headers `AEFKafkaSender(headers={...})` из настроек [app/core/config.py](app/core/config.py). |
 
 **Что эмитится в трейс:**
 
-- **`input_request "chat"`** + вложенный **`agent_start`** — обёртка `/chat` в [app/app.py](app/app.py). На `agent_start` спане проставлены `aef.agent_uid`, `aef.ttl`, `aef.hops`, `aef.stop_event`, `aef.session_id` (§21).
-- **`chain` / `llm` / `retriever` / `tool`** — автоматически через `AEFHandler` callback, передаваемый в `graph.ainvoke(config={"callbacks": [...]})` ([app/agents/graph.py](app/agents/graph.py)).
-- **`output_request`** — автоматически через OpenTelemetry instrumenting на httpx для вызовов `agent_tools_app.get_rate` ([app/services/deal_service.py](app/services/deal_service.py)) и `mail_app.send_reply` ([app/services/email_service.py](app/services/email_service.py)).
-- **`kafka_produce "produce_agent_result"`** и **`kafka_consume "consume_agent_task"`** — ручные обёртки в [app/services/kafka_producer.py](app/services/kafka_producer.py) / [app/services/kafka_consumer.py](app/services/kafka_consumer.py) (confluent-kafka не входит в auto-instrumented список SDK).
-- **`aef.is_mutation` / `aef.rollback_possible`** — атрибуты на спанах мутирующих действий: `kafka_produce`, `mail_app.send_reply` / `mail_app.mark_read` ([app/services/email_service.py](app/services/email_service.py) через `aef_custom_span`).
+- **`input_request "chat"`** + вложенный **`agent_start`** — обёртка `/chat` в [app/app.py](app/app.py). В input пишется исполняемый JSON запроса (`chat_id`, `message`, `x_trace_id`), в response — возвращаемый результат. На `agent_start` спане проставлены `aef.agent_uid`, `aef.agent_name`, `aef.operation_uid`, `aef.parent_operation_uid`, `aef.ttl`, `aef.hops`, `aef.hops_used`, `aef.stop_event`, `aef.session_id`, `aef.x_trace_id` (§21).
+- **Kafka entrypoints** — `consume_agent_task` для approve-flow и `consume_mail_incoming` для mail-flow обёрнуты в `aef_kafka_consume` + `agent_start` ([app/services/kafka_consumer.py](app/services/kafka_consumer.py), [app/services/mail_consumer.py](app/services/mail_consumer.py)). В трейс попадают входящий JSON, UID операции, TTL/hops/StopEvent и итоговый result payload.
+- **LangGraph actions/state changes** — каждый узел графа (`receive`, `parse_message`, `process_deals`, `check_thread`, `compose_response`, `send_response`) обёрнут в `trace_action_span(...)` ([app/agents/graph.py](app/agents/graph.py)). В span сохраняются входное состояние, config, state-delta/result, признаки `aef.is_mutation` и `aef.rollback_possible`.
+- **LLM calls** — извлечение условий и разбор ответов обёрнуты в `llm_call` spans вокруг реальных `llm.ainvoke(...)` ([app/agents/nodes/parse_message.py](app/agents/nodes/parse_message.py)); параллельно остаётся автоматический `AEFHandler` callback в `graph.ainvoke(config={"callbacks": [...]})`. В span пишутся prompt/messages, ответ LLM, hop на каждую попытку и `gigaplatform_stop_event` при отказе GP 403.
+- **Service/API calls** — `agent_tools_app.get_rate`, `mail_app.send_reply`, `mail_app.fetch_new_emails`, `mail_app.mark_read` имеют `service_call` / `api_call` spans с request/response/result payload, HTTP status, hop-attempt, `is_mutation` и `rollback_possible` ([app/services/deal_service.py](app/services/deal_service.py), [app/services/email_service.py](app/services/email_service.py)).
+- **Kafka produce** — `produce_agent_result` пишет request/result payload, `x-trace-id`, hop и признаки необратимой мутации при публикации результата approve-flow ([app/services/kafka_producer.py](app/services/kafka_producer.py)).
+- **Safe serialization** — [app/core/tracing.py](app/core/tracing.py) содержит `safe_trace_payload` / `safe_trace_json` / `SafeTraceSpan`: сложные типы приводятся к JSON/строке, payload ограничен `TRACING_MAX_PAYLOAD_SIZE`, ошибки самого tracing-слоя логируются и не прерывают бизнес-flow.
 
-**StopEvent (§21).** При TTL `asyncio.wait_for(timeout=settings.operation_ttl_sec)` на `agent_start` проставляется `aef.stop_event="ttl_exceeded"`; при `phase="error"` от графа — `"phase_error"`; в обоих случаях возвращается контролируемый ответ.
+**StopEvent (§21).** При TTL `asyncio.wait_for(timeout=settings.operation_ttl_sec)` на `agent_start` проставляется `aef.stop_event="ttl_exceeded"`; при `phase="error"` от графа — `"phase_error"`; при отказе GigaPlatform `403` с сообщением `The service is temporarily unavailable due to technical reasons.` — `"gigaplatform_stop_event"`. Во всех случаях возвращается контролируемый ответ.
 
-**PreView GigaChat (§26).** `_pick_model()` в [app/core/llm.py](app/core/llm.py) per-call выбирает Main или PreView; на каждом свежем `GigaChat(...)` подвешен `callbacks=[get_aef_handler()]` — SDK собирает `llm` span с фактической `model`. Выбор дополнительно логируется через stdlib `logging` (`gigachat_installation_picked. installation=... model=...`).
+**PreView GigaChat (§26).** `_pick_model()` в [app/core/llm.py](app/core/llm.py) per-call выбирает Main или PreView; `preview_ratio` валидируется как диапазон `0.0..0.05` (до 5% нагрузки). На каждом свежем `GigaChat(...)` подвешен `callbacks=[get_aef_handler()]` — SDK собирает `llm` span с фактической `model`. Выбор дополнительно логируется через stdlib `logging` (`gigachat_installation_picked. installation=... model=...`).
 
-Cross-service trace propagation (`X-Run-Id` / `X-Thread-Id` headers) удалена — `mail_app`/`approve_app` больше не передают свои ID. SDK генерирует `trace_id` сам.
+Cross-service propagation выполняется через `x-trace-id`: `/chat` возвращает его в response headers, HTTP-клиенты передают его в `agent_tools_app` / `mail_app`, Kafka producer публикует его в message headers.
 
 ---
 
 ## Надёжность / Retry (SECURITY §22 + §23)
 
-Все внешние вызовы (LLM, HTTP, Kafka) обёрнуты в **tenacity** с экспоненциальным jitter-backoff и селективной политикой повторов. Параметры — в [app/core/config.py](app/core/config.py), фабрика для LLM — [app/core/llm_retry.py](app/core/llm_retry.py).
+Внешние LLM/HTTP вызовы проходят через общий инфраструктурный retry-слой с ограниченным количеством попыток и exponential jitter-backoff. Бизнес-сервисы и LangGraph nodes не реализуют собственные циклы повторов: HTTP использует [app/core/http_retry.py](app/core/http_retry.py), LLM — [app/core/llm_retry.py](app/core/llm_retry.py). Kafka producer использует встроенный bounded retry/backoff `confluent-kafka`.
 
 | Слой | Где | Что ретраит | Параметры |
 | --- | --- | --- | --- |
-| **LLM** | [parse_message.py](app/agents/nodes/parse_message.py) → `llm_retrying_async()` | `429`, `5xx`, `httpx.TimeoutException`, transport (`ConnectError` / `RemoteProtocolError` / `OSError`). 4xx-non-429 и валидационные ошибки идут в node-level fallback сразу. | `llm_max_retries=3`, `llm_retry_base=0.5`, `llm_retry_max=5.0` |
-| **HTTP** | [deal_service.py](app/services/deal_service.py), [email_service.py](app/services/email_service.py) | `httpx.TimeoutException` / `ConnectError` / `RemoteProtocolError` / `HTTPStatusError` (5xx + 429 поднимается через `raise_for_status()`; 4xx-non-429 — в бизнес-ветку без повторов) | `http_max_retries=3`, `http_retry_base=0.5`, `http_retry_max=5.0` |
+| **LLM** | [parse_message.py](app/agents/nodes/parse_message.py) → `llm_ainvoke_with_retry()` | HTTP `500/502/503/504`, `httpx.TimeoutException`, transport (`ConnectError` / `RemoteProtocolError` / `OSError`). `429`, прочие `4xx`, валидационные и бизнес-ошибки не ретраятся. | `llm_max_retries=3`, `llm_retry_base=0.5`, `llm_retry_max=5.0`, `llm_retry_exp_base=2.0`, `llm_retry_jitter=1.0` |
+| **HTTP** | [deal_service.py](app/services/deal_service.py), [email_service.py](app/services/email_service.py), [startup_checkup.py](app/core/startup_checkup.py) → `request_with_retry()` | `httpx.RequestError` и HTTP `500/502/503/504`. `408`, `429`, прочие `4xx` не ретраятся и передаются бизнес-обработчику. | `http_max_retries=3`, `http_retry_base=0.5`, `http_retry_max=5.0`, `http_retry_exp_base=2.0`, `http_retry_jitter=1.0` |
 | **Kafka producer** | [kafka_producer.py](app/services/kafka_producer.py) | Транспортные сбои confluent-kafka | `enable.idempotence=true`, `acks=all`, `retries=5`, `retry.backoff.ms=200..5000` |
 
 **Типизированные события при деградации GigaChat.** Классификатор `classify_gigachat_error()` ([app/core/llm_retry.py](app/core/llm_retry.py)) отображает любое исключение по `status_code` / `response.status_code` / типу:
 
 | Класс ошибки | Событие | Ретраится? |
 | --- | --- | --- |
-| HTTP 429 | `gigachat_rate_limited` | да |
-| HTTP 5xx | `gigachat_5xx_failed` | да |
+| HTTP 429 | `gigachat_rate_limited` | нет |
+| HTTP 500/502/503/504 | `gigachat_5xx_failed` | да |
+| прочие HTTP 5xx | `gigachat_response_error` | нет |
+| HTTP 403 + GigaPlatform stop message | `gigaplatform_stop_event` | нет |
 | `httpx.TimeoutException` / `asyncio.TimeoutError` | `gigachat_timeout` | да |
 | `httpx.ConnectError` / `RemoteProtocolError` / `OSError` | `gigachat_transport_error` | да |
-| HTTP 4xx (не 429) | `gigachat_response_error` | нет |
+| HTTP 4xx (включая 408) | `gigachat_response_error` | нет |
 | прочее | `gigachat_unknown_error` | нет |
 
-На каждой попытке `before_sleep=_log_llm_retry` пишет событие с `attempt`, `next_wait_sec`, `exc_type`, `will_retry=True`. После исчерпания `log_llm_exhausted()` пишет то же событие с `will_retry=False` и пробрасывает исходное исключение в наружный `except` — он собирает `warnings` и продолжает с пустыми `conditions`. Если все фрагменты упали — узел возвращает `phase="error"`, граф уходит в `compose_response` со шаблонным извинением, `mail_app` получает контролируемый ответ.
+На каждой попытке инфраструктурный слой пишет start/success/error, а `before_sleep` фиксирует `attempt`, `next_wait_sec`, `exc_type`, `will_retry=True`. После исчерпания `log_llm_exhausted()` пишет событие с `will_retry=False` и пробрасывает исходное исключение в наружный `except` — он собирает `warnings` и продолжает с пустыми `conditions`. Если все фрагменты упали — узел возвращает `phase="error"`, граф уходит в `compose_response` со шаблонным извинением, `mail_app` получает контролируемый ответ.
 
 В Loki/OpenSearch: `event=gigachat_*` группируется → метрика «доля 429 vs 5xx vs timeout»; `will_retry=true/false` → доля исчерпаний. В UI AEF Manager Traces разбор цепочки ретраев по конкретному запросу — фильтр `session_id=<chat_id>` поднимает все спаны одного `/chat` вызова, включая внутренние повторы LLM/HTTP.
 
@@ -478,6 +483,8 @@ Consumer запускается в daemon-потоке при старте FastA
 | `llm_max_retries` | `3` | Кол-во попыток LLM-вызова (SECURITY §22/§23) |
 | `llm_retry_base` | `0.5` | Стартовый backoff (сек) для tenacity exponential jitter |
 | `llm_retry_max` | `5.0` | Максимальный backoff (сек) для tenacity exponential jitter |
+| `llm_retry_exp_base` | `2.0` | Множитель exponential backoff для LLM |
+| `llm_retry_jitter` | `1.0` | Максимальный jitter (сек) для LLM retry |
 | `profanity_check` | `False` | Проверка на нецензурную лексику |
 | `verify_ssl_certs` | `False` | Верификация SSL |
 
