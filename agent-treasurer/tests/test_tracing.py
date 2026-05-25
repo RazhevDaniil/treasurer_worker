@@ -8,7 +8,7 @@ from importlib.util import find_spec
 
 os.environ.setdefault("TRACING_SERVICE_KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
-if find_spec("aef_tracing") is None:
+if "aef_tracing" not in sys.modules and find_spec("aef_tracing") is None:
     aef_tracing = types.ModuleType("aef_tracing")
     exporters = types.ModuleType("aef_tracing.exporters")
     span_processors = types.ModuleType("aef_tracing.span_processors")

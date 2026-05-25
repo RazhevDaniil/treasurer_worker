@@ -8,53 +8,13 @@ on behalf of the deal agent.
 import logging
 
 import httpx
-from tenacity import (
-    AsyncRetrying,
-    RetryCallState,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 from typing import Optional
 
 from ..core.config import settings
-from ..core.tracing import record_hop, safe_trace_json, trace_action_span, trace_header_dict
+from ..core.http_retry import request_with_retry
+from ..core.tracing import safe_trace_json, trace_action_span, trace_header_dict
 
 logger = logging.getLogger(__name__)
-
-
-def _log_http_retry(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    next_wait_sec = round(retry_state.next_action.sleep, 3) if retry_state.next_action else None
-    exc_type = type(exc).__name__ if exc else None
-    exc_str = str(exc) if exc else None
-    logger.info(
-        f"http_retry. attempt={retry_state.attempt_number} "
-        f"next_wait_sec={next_wait_sec} exc_type={exc_type} exc={exc_str}"
-    )
-
-
-_RETRYABLE_HTTP_EXC = (
-    httpx.TimeoutException,
-    httpx.ConnectError,
-    httpx.RemoteProtocolError,
-    httpx.HTTPStatusError,
-)
-
-
-def _retryable_status(status_code: int) -> bool:
-    return status_code >= 500 or status_code == 429
-
-
-def _http_response_payload(response: httpx.Response) -> dict:
-    try:
-        body = response.json()
-    except Exception:
-        body = response.text
-    return {
-        "status_code": response.status_code,
-        "body": body,
-    }
 
 
 class EmailService:
@@ -116,33 +76,15 @@ class EmailService:
             try:
                 response: httpx.Response | None = None
                 async with self._client() as client:
-                    async for attempt in AsyncRetrying(
-                        retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                        stop=stop_after_attempt(settings.http_max_retries),
-                        wait=wait_exponential_jitter(
-                            initial=settings.http_retry_base,
-                            max=settings.http_retry_max,
-                        ),
-                        before_sleep=_log_http_retry,
-                        reraise=True,
-                    ):
-                        with attempt:
-                            hop = record_hop()
-                            span.add_span_attributes(**{
-                                "aef.hops_used": hop,
-                                "aef.http_attempt": attempt.retry_state.attempt_number,
-                            })
-                            response = await client.post(
-                                "/api/v1/send_reply",
-                                json=payload,
-                                headers=trace_header_dict({"X-Account-ID": self.account_id}),
-                            )
-                            span.add_span_attributes(**{
-                                "aef.http_status_code": response.status_code,
-                                "aef.response_payload": safe_trace_json(_http_response_payload(response)),
-                            })
-                            if _retryable_status(response.status_code):
-                                response.raise_for_status()
+                    response = await request_with_retry(
+                        client,
+                        "POST",
+                        "/api/v1/send_reply",
+                        operation_name="mail_app.send_reply",
+                        trace_span=span,
+                        json=payload,
+                        headers=trace_header_dict({"X-Account-ID": self.account_id}),
+                    )
                 if response is None:
                     span.add_output_result({"sent": False, "error": "empty_response"})
                     return False
@@ -198,33 +140,15 @@ class EmailService:
             try:
                 response: httpx.Response | None = None
                 async with self._client() as client:
-                    async for attempt in AsyncRetrying(
-                        retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                        stop=stop_after_attempt(settings.http_max_retries),
-                        wait=wait_exponential_jitter(
-                            initial=settings.http_retry_base,
-                            max=settings.http_retry_max,
-                        ),
-                        before_sleep=_log_http_retry,
-                        reraise=True,
-                    ):
-                        with attempt:
-                            hop = record_hop()
-                            span.add_span_attributes(**{
-                                "aef.hops_used": hop,
-                                "aef.http_attempt": attempt.retry_state.attempt_number,
-                            })
-                            response = await client.get(
-                                f"/api/v1/imap/emails",
-                                params=request_payload,
-                                headers=trace_header_dict({"X-Account-ID": self.account_id}),
-                            )
-                            span.add_span_attributes(**{
-                                "aef.http_status_code": response.status_code,
-                                "aef.response_payload": safe_trace_json(_http_response_payload(response)),
-                            })
-                            if _retryable_status(response.status_code):
-                                response.raise_for_status()
+                    response = await request_with_retry(
+                        client,
+                        "GET",
+                        "/api/v1/imap/emails",
+                        operation_name="mail_app.fetch_new_emails",
+                        trace_span=span,
+                        params=request_payload,
+                        headers=trace_header_dict({"X-Account-ID": self.account_id}),
+                    )
                 if response is None:
                     span.add_output_result({"emails": [], "error": "empty_response"})
                     return []
@@ -273,33 +197,15 @@ class EmailService:
             try:
                 response: httpx.Response | None = None
                 async with self._client() as client:
-                    async for attempt in AsyncRetrying(
-                        retry=retry_if_exception_type(_RETRYABLE_HTTP_EXC),
-                        stop=stop_after_attempt(settings.http_max_retries),
-                        wait=wait_exponential_jitter(
-                            initial=settings.http_retry_base,
-                            max=settings.http_retry_max,
-                        ),
-                        before_sleep=_log_http_retry,
-                        reraise=True,
-                    ):
-                        with attempt:
-                            hop = record_hop()
-                            span.add_span_attributes(**{
-                                "aef.hops_used": hop,
-                                "aef.http_attempt": attempt.retry_state.attempt_number,
-                            })
-                            response = await client.post(
-                                f"/api/v1/imap/mark-read",
-                                json=payload,
-                                headers=trace_header_dict({"X-Account-ID": self.account_id}),
-                            )
-                            span.add_span_attributes(**{
-                                "aef.http_status_code": response.status_code,
-                                "aef.response_payload": safe_trace_json(_http_response_payload(response)),
-                            })
-                            if _retryable_status(response.status_code):
-                                response.raise_for_status()
+                    response = await request_with_retry(
+                        client,
+                        "POST",
+                        "/api/v1/imap/mark-read",
+                        operation_name="mail_app.mark_read",
+                        trace_span=span,
+                        json=payload,
+                        headers=trace_header_dict({"X-Account-ID": self.account_id}),
+                    )
                 if response is None:
                     span.add_output_result({"marked": False, "error": "empty_response"})
                     return False

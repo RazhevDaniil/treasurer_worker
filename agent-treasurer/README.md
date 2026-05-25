@@ -146,27 +146,28 @@ Cross-service propagation выполняется через `x-trace-id`: `/chat
 
 ## Надёжность / Retry (SECURITY §22 + §23)
 
-Все внешние вызовы (LLM, HTTP, Kafka) обёрнуты в **tenacity** с экспоненциальным jitter-backoff и селективной политикой повторов. Параметры — в [app/core/config.py](app/core/config.py), фабрика для LLM — [app/core/llm_retry.py](app/core/llm_retry.py).
+Внешние LLM/HTTP вызовы проходят через общий инфраструктурный retry-слой с ограниченным количеством попыток и exponential jitter-backoff. Бизнес-сервисы и LangGraph nodes не реализуют собственные циклы повторов: HTTP использует [app/core/http_retry.py](app/core/http_retry.py), LLM — [app/core/llm_retry.py](app/core/llm_retry.py). Kafka producer использует встроенный bounded retry/backoff `confluent-kafka`.
 
 | Слой | Где | Что ретраит | Параметры |
 | --- | --- | --- | --- |
-| **LLM** | [parse_message.py](app/agents/nodes/parse_message.py) → `llm_retrying_async()` | `429`, `5xx`, `httpx.TimeoutException`, transport (`ConnectError` / `RemoteProtocolError` / `OSError`). 4xx-non-429 и валидационные ошибки идут в node-level fallback сразу. | `llm_max_retries=3`, `llm_retry_base=0.5`, `llm_retry_max=5.0` |
-| **HTTP** | [deal_service.py](app/services/deal_service.py), [email_service.py](app/services/email_service.py) | `httpx.TimeoutException` / `ConnectError` / `RemoteProtocolError` / `HTTPStatusError` (5xx + 429 поднимается через `raise_for_status()`; 4xx-non-429 — в бизнес-ветку без повторов) | `http_max_retries=3`, `http_retry_base=0.5`, `http_retry_max=5.0` |
+| **LLM** | [parse_message.py](app/agents/nodes/parse_message.py) → `llm_ainvoke_with_retry()` | HTTP `500/502/503/504`, `httpx.TimeoutException`, transport (`ConnectError` / `RemoteProtocolError` / `OSError`). `429`, прочие `4xx`, валидационные и бизнес-ошибки не ретраятся. | `llm_max_retries=3`, `llm_retry_base=0.5`, `llm_retry_max=5.0`, `llm_retry_exp_base=2.0`, `llm_retry_jitter=1.0` |
+| **HTTP** | [deal_service.py](app/services/deal_service.py), [email_service.py](app/services/email_service.py), [startup_checkup.py](app/core/startup_checkup.py) → `request_with_retry()` | `httpx.RequestError` и HTTP `500/502/503/504`. `408`, `429`, прочие `4xx` не ретраятся и передаются бизнес-обработчику. | `http_max_retries=3`, `http_retry_base=0.5`, `http_retry_max=5.0`, `http_retry_exp_base=2.0`, `http_retry_jitter=1.0` |
 | **Kafka producer** | [kafka_producer.py](app/services/kafka_producer.py) | Транспортные сбои confluent-kafka | `enable.idempotence=true`, `acks=all`, `retries=5`, `retry.backoff.ms=200..5000` |
 
 **Типизированные события при деградации GigaChat.** Классификатор `classify_gigachat_error()` ([app/core/llm_retry.py](app/core/llm_retry.py)) отображает любое исключение по `status_code` / `response.status_code` / типу:
 
 | Класс ошибки | Событие | Ретраится? |
 | --- | --- | --- |
-| HTTP 429 | `gigachat_rate_limited` | да |
-| HTTP 5xx | `gigachat_5xx_failed` | да |
+| HTTP 429 | `gigachat_rate_limited` | нет |
+| HTTP 500/502/503/504 | `gigachat_5xx_failed` | да |
+| прочие HTTP 5xx | `gigachat_response_error` | нет |
 | HTTP 403 + GigaPlatform stop message | `gigaplatform_stop_event` | нет |
 | `httpx.TimeoutException` / `asyncio.TimeoutError` | `gigachat_timeout` | да |
 | `httpx.ConnectError` / `RemoteProtocolError` / `OSError` | `gigachat_transport_error` | да |
-| HTTP 4xx (не 429) | `gigachat_response_error` | нет |
+| HTTP 4xx (включая 408) | `gigachat_response_error` | нет |
 | прочее | `gigachat_unknown_error` | нет |
 
-На каждой попытке `before_sleep=_log_llm_retry` пишет событие с `attempt`, `next_wait_sec`, `exc_type`, `will_retry=True`. После исчерпания `log_llm_exhausted()` пишет то же событие с `will_retry=False` и пробрасывает исходное исключение в наружный `except` — он собирает `warnings` и продолжает с пустыми `conditions`. Если все фрагменты упали — узел возвращает `phase="error"`, граф уходит в `compose_response` со шаблонным извинением, `mail_app` получает контролируемый ответ.
+На каждой попытке инфраструктурный слой пишет start/success/error, а `before_sleep` фиксирует `attempt`, `next_wait_sec`, `exc_type`, `will_retry=True`. После исчерпания `log_llm_exhausted()` пишет событие с `will_retry=False` и пробрасывает исходное исключение в наружный `except` — он собирает `warnings` и продолжает с пустыми `conditions`. Если все фрагменты упали — узел возвращает `phase="error"`, граф уходит в `compose_response` со шаблонным извинением, `mail_app` получает контролируемый ответ.
 
 В Loki/OpenSearch: `event=gigachat_*` группируется → метрика «доля 429 vs 5xx vs timeout»; `will_retry=true/false` → доля исчерпаний. В UI AEF Manager Traces разбор цепочки ретраев по конкретному запросу — фильтр `session_id=<chat_id>` поднимает все спаны одного `/chat` вызова, включая внутренние повторы LLM/HTTP.
 
@@ -482,6 +483,8 @@ Consumer запускается в daemon-потоке при старте FastA
 | `llm_max_retries` | `3` | Кол-во попыток LLM-вызова (SECURITY §22/§23) |
 | `llm_retry_base` | `0.5` | Стартовый backoff (сек) для tenacity exponential jitter |
 | `llm_retry_max` | `5.0` | Максимальный backoff (сек) для tenacity exponential jitter |
+| `llm_retry_exp_base` | `2.0` | Множитель exponential backoff для LLM |
+| `llm_retry_jitter` | `1.0` | Максимальный jitter (сек) для LLM retry |
 | `profanity_check` | `False` | Проверка на нецензурную лексику |
 | `verify_ssl_certs` | `False` | Верификация SSL |
 

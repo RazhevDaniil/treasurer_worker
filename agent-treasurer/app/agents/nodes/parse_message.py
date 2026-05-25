@@ -22,10 +22,10 @@ from ...core.llm import get_llm_with_config
 from ...core.llm_retry import (
     GIGAPLATFORM_STOP_EVENT,
     is_gigaplatform_stop_event,
-    llm_retrying_async,
+    llm_ainvoke_with_retry,
     log_llm_exhausted,
 )
-from ...core.tracing import record_hop, safe_trace_json, trace_action_span
+from ...core.tracing import safe_trace_json, trace_action_span
 from ...models.schemas import (
     Deal,
     DealConditions,
@@ -348,12 +348,12 @@ async def _extract_deal_conditions(message_text: str) -> DealConditions:
         },
     ) as span:
         try:
-            result = None
-            async for attempt in llm_retrying_async():
-                with attempt:
-                    hop = record_hop()
-                    span.add_span_attributes(**{"aef.hops_used": hop})
-                    result = await llm.ainvoke(messages)
+            result = await llm_ainvoke_with_retry(
+                llm,
+                messages,
+                purpose="extract_deal_conditions",
+                trace_span=span,
+            )
         except Exception as exc:
             if is_gigaplatform_stop_event(exc):
                 span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})
@@ -443,12 +443,12 @@ async def _extract_reply_update(
         },
     ) as span:
         try:
-            raw_update = None
-            async for attempt in llm_retrying_async():
-                with attempt:
-                    hop = record_hop()
-                    span.add_span_attributes(**{"aef.hops_used": hop})
-                    raw_update = await llm.ainvoke(messages)
+            raw_update = await llm_ainvoke_with_retry(
+                llm,
+                messages,
+                purpose="extract_reply_update",
+                trace_span=span,
+            )
         except Exception as exc:
             if is_gigaplatform_stop_event(exc):
                 span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})

@@ -4,41 +4,13 @@ import logging
 from typing import Optional
 
 import httpx
-from tenacity import (
-    AsyncRetrying,
-    RetryCallState,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 
 from ..core.config import settings
-from ..core.tracing import record_hop, safe_trace_json, trace_action_span, trace_header_dict
+from ..core.http_retry import request_with_retry
+from ..core.tracing import safe_trace_json, trace_action_span, trace_header_dict
 from ..models.schemas import Deal, DealConditions, RateError
 
 logger = logging.getLogger(__name__)
-
-
-def _http_response_payload(response: httpx.Response) -> dict:
-    try:
-        body = response.json()
-    except Exception:
-        body = response.text
-    return {
-        "status_code": response.status_code,
-        "body": body,
-    }
-
-
-def _log_http_retry(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    next_wait_sec = round(retry_state.next_action.sleep, 3) if retry_state.next_action else None
-    exc_type = type(exc).__name__ if exc else None
-    exc_str = str(exc) if exc else None
-    logger.info(
-        f"http_retry. attempt={retry_state.attempt_number} "
-        f"next_wait_sec={next_wait_sec} exc_type={exc_type} exc={exc_str}"
-    )
 
 
 class DealService:
@@ -87,46 +59,31 @@ class DealService:
                 response: httpx.Response | None = None
 
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    async for attempt in AsyncRetrying(
-                        retry=retry_if_exception_type((
-                            httpx.TimeoutException,
-                            httpx.ConnectError,
-                            httpx.RemoteProtocolError,
-                            httpx.HTTPStatusError,
-                        )),
-                        stop=stop_after_attempt(settings.http_max_retries),
-                        wait=wait_exponential_jitter(
-                            initial=settings.http_retry_base,
-                            max=settings.http_retry_max,
-                        ),
-                        before_sleep=_log_http_retry,
-                        reraise=True,
-                    ):
-                        with attempt:
-                            hop = record_hop()
-                            span.add_span_attributes(**{
-                                "aef.hops_used": hop,
-                                "aef.http_attempt": attempt.retry_state.attempt_number,
-                            })
-                            response = await client.post(
-                                f"{settings.tool_api_url}/api/get_rate",
-                                json=payload,
-                                headers=trace_header_dict(),
-                            )
-                            span.add_span_attributes(**{
-                                "aef.http_status_code": response.status_code,
-                                "aef.response_payload": safe_trace_json(_http_response_payload(response)),
-                            })
-                            # Retry only on transport-level recoverable statuses;
-                            # 4xx (except 429) flows to the business-error branch below.
-                            if response.status_code >= 500 or response.status_code == 429:
-                                response.raise_for_status()
+                    response = await request_with_retry(
+                        client,
+                        "POST",
+                        f"{settings.tool_api_url}/api/get_rate",
+                        operation_name="agent_tools_app.get_rate",
+                        trace_span=span,
+                        json=payload,
+                        headers=trace_header_dict(),
+                    )
                 if response is None:
                     span.add_span_attributes(**{
                         "aef.result_payload": safe_trace_json({"error": "empty_response"}),
                     })
                     return None, RateError.SERVICE_UNAVAILABLE
                 if response.is_error:
+                    if response.status_code in (408, 429):
+                        logger.warning(
+                            f"get_rate_temporary_http_error_no_retry. "
+                            f"status_code={response.status_code}"
+                        )
+                        span.add_output_result({
+                            "rates": None,
+                            "error": RateError.SERVICE_UNAVAILABLE.value,
+                        })
+                        return None, RateError.SERVICE_UNAVAILABLE
                     if conditions.currency in ("CNY", "INR"):
                         logger.warning(
                             f"get_rate_currency_not_supported. "

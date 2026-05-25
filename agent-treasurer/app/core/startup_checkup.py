@@ -16,7 +16,9 @@ from typing import Awaitable, Callable
 import httpx
 
 from .config import settings
+from .http_retry import request_with_retry
 from .llm import get_llm
+from .llm_retry import llm_ainvoke_with_retry
 from .tracing import bind_x_trace_id, trace_header_dict
 from ..models.schemas import DealConditions
 from ..services.deal_service import DealService
@@ -42,7 +44,11 @@ async def _check_gigachat() -> None:
     """Synthetic LLM ping. Raises on timeout or empty content."""
     llm = get_llm()
     response = await asyncio.wait_for(
-        llm.ainvoke([{"role": "user", "content": "Ответь одним словом: OK"}]),
+        llm_ainvoke_with_retry(
+            llm,
+            [{"role": "user", "content": "Ответь одним словом: OK"}],
+            purpose="readiness_gigachat",
+        ),
         timeout=settings.readiness_gigachat_timeout_sec,
     )
     content = getattr(response, "content", None) or ""
@@ -53,8 +59,11 @@ async def _check_gigachat() -> None:
 async def _check_mail_app() -> None:
     """Probe mail_app liveness."""
     async with httpx.AsyncClient(timeout=settings.readiness_mail_timeout_sec) as client:
-        resp = await client.get(
+        resp = await request_with_retry(
+            client,
+            "GET",
             f"{settings.mail_server_api_url}/health/live",
+            operation_name="readiness.mail_app",
             headers=trace_header_dict(),
         )
         resp.raise_for_status()

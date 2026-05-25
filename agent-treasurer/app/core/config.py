@@ -72,6 +72,14 @@ class Settings(BaseSettings):
         default=5.0,
         description="Maximum backoff in seconds for exponential-jitter wait between LLM retries (SECURITY §22/§23).",
     )
+    llm_retry_exp_base: float = Field(
+        default=2.0,
+        description="Exponential base/multiplier for LLM retry backoff.",
+    )
+    llm_retry_jitter: float = Field(
+        default=1.0,
+        description="Max random jitter in seconds added to LLM retry backoff.",
+    )
     profanity_check: bool=False
     verify_ssl_certs: bool=False
 
@@ -279,6 +287,14 @@ class Settings(BaseSettings):
     http_retry_max: float = Field(
         default=5.0,
         description="Maximum backoff in seconds for exponential-jitter wait between HTTP retries.",
+    )
+    http_retry_exp_base: float = Field(
+        default=2.0,
+        description="Exponential base/multiplier for outbound HTTP retry backoff.",
+    )
+    http_retry_jitter: float = Field(
+        default=1.0,
+        description="Max random jitter in seconds added to outbound HTTP retry backoff.",
     )
 
     # === Kafka producer retry (SECURITY §22) ===
