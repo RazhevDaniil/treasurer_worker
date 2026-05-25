@@ -5,6 +5,7 @@ from ..config import Settings
 from ..services.in_memory_db import InMemoryDbClient
 from ..services.agent_client import AgentKafkaPublisher, AgentPublishError
 from ..utils.backoff import next_retry_time
+from ..utils.tracing import resolve_trace_id
 
 logger = logging.getLogger("workers.agent_dispatcher")
 
@@ -53,6 +54,7 @@ class AgentDispatcher:
         message_id = payload.get("message_id", "")
         thread_id = payload.get("thread_id", "")
         sender_email = payload.get("sender_email", "")
+        trace_id = resolve_trace_id(payload=payload)
 
         try:
             await asyncio.to_thread(
@@ -61,10 +63,15 @@ class AgentDispatcher:
                 task_id,
             )
 
-            await self.db_client.update_task_status(task_id, "DONE", claim_token)
+            await self.db_client.update_task_status(
+                task_id,
+                "DONE",
+                claim_token,
+                run_id=trace_id,
+            )
             logger.info(
-                "Agent dispatched message_id=%s thread_id=%s sender=%s task_id=%s",
-                message_id, thread_id, sender_email, task_id,
+                "Agent dispatched message_id=%s thread_id=%s sender=%s task_id=%s trace_id=%s",
+                message_id, thread_id, sender_email, task_id, trace_id,
             )
         except AgentPublishError as e:
             msg = str(e)
@@ -73,13 +80,24 @@ class AgentDispatcher:
                 message_id, thread_id, task_id, msg,
             )
             if attempt >= self.settings.max_attempts:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg,
+                    run_id=trace_id,
+                )
                 return
             next_retry = next_retry_time(
                 attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
             )
             await self.db_client.update_task_status(
-                task_id, "RETRYING", claim_token, error=msg, next_retry_at=next_retry
+                task_id,
+                "RETRYING",
+                claim_token,
+                error=msg,
+                next_retry_at=next_retry,
+                run_id=trace_id,
             )
 
         except Exception as e:
@@ -89,11 +107,22 @@ class AgentDispatcher:
                 message_id, thread_id, task_id, msg,
             )
             if attempt >= self.settings.max_attempts:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg,
+                    run_id=trace_id,
+                )
                 return
             next_retry = next_retry_time(
                 attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
             )
             await self.db_client.update_task_status(
-                task_id, "RETRYING", claim_token, error=msg, next_retry_at=next_retry
+                task_id,
+                "RETRYING",
+                claim_token,
+                error=msg,
+                next_retry_at=next_retry,
+                run_id=trace_id,
             )

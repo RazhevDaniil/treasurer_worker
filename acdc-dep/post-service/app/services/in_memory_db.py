@@ -9,6 +9,8 @@ from datetime import datetime
 
 from cachetools import TTLCache
 
+from ..utils.tracing import resolve_trace_id
+
 logger = logging.getLogger("services.in_memory_db")
 
 _TTL = 86_400  # 24 hours
@@ -37,7 +39,9 @@ class InMemoryDbClient:
         headers_json: dict | None = None,
         thread_id: str,
         task_key: str,
+        run_id: str | None = None,
     ) -> dict:
+        trace_id = resolve_trace_id(run_id, payload={"headers_json": headers_json})
         if message_id in self._messages:
             logger.info("in_memory dedup: message_id=%s already exists", message_id)
             return self._messages[message_id]
@@ -53,6 +57,7 @@ class InMemoryDbClient:
             "body_html": body_html,
             "headers_json": headers_json,
             "thread_id": thread_id,
+            "run_id": trace_id,
         }
         self._messages[message_id] = record
 
@@ -73,7 +78,10 @@ class InMemoryDbClient:
                 "body_html": body_html,
                 "headers_json": headers_json,
                 "thread_id": thread_id,
+                "x_trace_id": trace_id,
+                "run_id": trace_id,
             },
+            "run_id": trace_id,
         }
         self._tasks[task_id] = task
         await self._queues["PROCESS_INCOMING"].put(task_id)
@@ -92,7 +100,9 @@ class InMemoryDbClient:
         thread_id: str,
         smtp_payload: dict | None = None,
         task_key: str,
+        run_id: str | None = None,
     ) -> dict:
+        trace_id = resolve_trace_id(run_id, payload=smtp_payload)
         record = {
             "id": str(uuid.uuid4()),
             "message_id": message_id,
@@ -101,8 +111,13 @@ class InMemoryDbClient:
             "body_text": body_text,
             "headers_json": headers_json,
             "thread_id": thread_id,
+            "run_id": trace_id,
         }
         self._messages[message_id] = record
+
+        payload = dict(smtp_payload or {})
+        payload["x_trace_id"] = trace_id
+        payload["run_id"] = trace_id
 
         task_id = str(uuid.uuid4())
         task = {
@@ -111,7 +126,8 @@ class InMemoryDbClient:
             "status": "PENDING",
             "attempt": 1,
             "claim_token": str(uuid.uuid4()),
-            "payload_json": smtp_payload or {},
+            "payload_json": payload,
+            "run_id": trace_id,
         }
         self._tasks[task_id] = task
         await self._queues["SEND_SMTP"].put(task_id)
@@ -156,6 +172,7 @@ class InMemoryDbClient:
         claim_token: str,
         error: str | None = None,
         next_retry_at: datetime | None = None,
+        run_id: str | None = None,
     ) -> None:
         task = self._tasks.get(task_id)
         if task is None:

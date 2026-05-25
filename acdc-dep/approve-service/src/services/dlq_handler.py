@@ -12,6 +12,7 @@ from ..config import settings
 from ..models.task import TaskStatus
 from ..services.db_client import DbClient
 from ..utils.logger import get_logger
+from ..utils.tracing import resolve_trace_id
 
 log = get_logger(__name__)
 
@@ -73,10 +74,12 @@ class DlqHandler:
                 # Финальный неуспех — переводим задачу в FAILED с error_message.
                 task = self._db.get_task_by_calculation_id(calculation_id)
                 if task is not None:
+                    trace_id = resolve_trace_id(task.run_id, fallback=task.task_id)
                     self._db.update_task_status(
                         task.task_id,
                         TaskStatus.FAILED,
                         error_message=str(exc),
+                        run_id=trace_id,
                     )
                 self._consumer.commit(message=msg)
 

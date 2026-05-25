@@ -73,6 +73,7 @@ class SnapshotCreate(BaseModel):
     """Тело POST /approve/snapshots — создание snapshot'а с привязкой к task_id."""
     calc_id: str
     task_id: str
+    run_id: str | None = None
     # Финансовые показатели (Decimal)
     policy_rate: Decimal | None = None
     ets: Decimal | None = None

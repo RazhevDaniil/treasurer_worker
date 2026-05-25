@@ -8,6 +8,7 @@ from ..config import Settings
 from ..services.in_memory_db import InMemoryDbClient
 from ..services.imap_client import ImapClient, ImapAuthError
 from ..services.email_parser import parse_email_bytes
+from ..utils.tracing import TRACE_HEADER_NAME, resolve_trace_id
 
 logger = logging.getLogger("workers.imap")
 
@@ -54,6 +55,7 @@ class ImapWorker:
 
     async def _handle_one(self, uid: int, uidvalidity: int, raw_bytes: bytes) -> None:
         parsed, thread_root = parse_email_bytes(raw_bytes)
+        trace_id = resolve_trace_id()
 
         domain = (
             self.settings.smtp_from_address.split("@")[-1]
@@ -71,6 +73,7 @@ class ImapWorker:
             headers["To"] = parsed.recipient_email
         if parsed.reply_to_email:
             headers["Reply-To"] = parsed.reply_to_email
+        headers[TRACE_HEADER_NAME] = trace_id
 
         try:
             await self.db_client.ingest_message(
@@ -84,8 +87,15 @@ class ImapWorker:
                 headers_json=headers or None,
                 thread_id=thread_root or message_id,
                 task_key=message_id,
+                run_id=trace_id,
             )
-            logger.info("IMAP ingested message_id=%s thread_id=%s uid=%s", message_id, thread_root or message_id, uid)
+            logger.info(
+                "IMAP ingested message_id=%s thread_id=%s uid=%s trace_id=%s",
+                message_id,
+                thread_root or message_id,
+                uid,
+                trace_id,
+            )
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 409:
                 logger.info("IMAP dedup: message_id=%s already processed", message_id)

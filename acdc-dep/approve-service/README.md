@@ -323,23 +323,16 @@ GET /approve/tasks/by-calculation/{calculation_id}
 
 ---
 
-## Трейс операции (thread_id / task_id)
+## Трейс операции (`x-trace-id` / `task_id`)
 
-Сервис — Kafka-оркестратор (не AI-агент). Кросс-сервисная trace-корреляция (Kafka headers `x-run-id` / `x-thread-id`, HTTP headers `X-Run-Id` / `X-Thread-Id`, аудит-столбцы `run_id` в `db_app`-таблицах) **удалена** в рамках миграции агентов на AEF SDK (см. [SECURITY_COMPLIANCE_SDK.md §1](../SECURITY_COMPLIANCE_SDK.md)) — `agent_treasurer_app` теперь генерирует собственный `trace_id` через AEF SDK на каждый `kafka_consume` спан.
+Сервис — Kafka-оркестратор (не AI-агент), но он сохраняет сквозной UID бизнес-операции. Канонический заголовок: `x-trace-id`, значение — UUID v4. Если входящее сообщение не содержит валидный UID, `approve-service` генерирует новый UUID v4, сохраняет его в `approve_tasks.run_id` / `approve_deal_snapshots.run_id`, прокидывает в HTTP headers к `db-service` и CalcFundCost, а также в Kafka headers к `agent_treasurer` и во внешний result topic.
 
-### Что осталось от корреляции
+### Что участвует в корреляции
 
-- **`task_id` / `calculation_id`** — единственные связующие идентификаторы операции между этапами `CspAgentConsumer` → CalcFundCost → `AgentTaskProducer` → treasurer → `AgentResultConsumer` → `CspResultProducer`. Стабильный `task_id` генерируется в дедупликации (`deduplication_service.check_and_register`) и хранится в `approve_tasks` + `approve_deal_snapshots.task_id` (UNIQUE FK).
-- **`thread_id = task_id`** биндится в `bound_trace` в consumer'ах для локальной structlog-корреляции stdout-логов; `merge_contextvars` подмешивает его во все события записанные под bound (см. [`utils/logger.py`](src/utils/logger.py)).
-- **TTL-retry под одним `task_id`** — `TtlWatchdog` идентифицирует задачу по `task_id`, attempt_count увеличивается на каждый retry. Все retry-попытки логически одна операция, корреляция через PK таблицы — `run_id`-столбец для этого не нужен.
-
-### Сквозная корреляция через AEF SDK
-
-Cross-service trace approve_app → treasurer → approve_app идёт **не через approve_app**, а через AEF SDK на стороне treasurer'а:
-
-- treasurer'ский `kafka_consume "consume_agent_task"` спан получает свой `trace_id` от SDK и помечается `attributes.aef.session_id = task_id` ([`agent_treasurer_app/app/services/kafka_consumer.py`](../agent_treasurer_app/app/services/kafka_consumer.py)).
-- В UI AEF Manager Traces разбор инцидента по `calculation_id`/`task_id` ведётся фильтром `session_id=<task_id>`.
-- На стороне `approve_app` для разбора инцидента используется бизнес-идентификатор (`task_id` / `calculation_id`), который есть и в payload Kafka, и в `approve_tasks` таблице.
+- **`x-trace-id` / `run_id`** — сквозной UID родительской операции. Не меняется при enrichment, отправке задачи агенту, получении результата, TTL-retry и DLQ-reprocess.
+- **`task_id` / `calculation_id`** — бизнес-ключи approve-flow. Стабильный `task_id` генерируется в дедупликации (`deduplication_service.check_and_register`) и хранится в `approve_tasks` + `approve_deal_snapshots.task_id` (UNIQUE FK).
+- **`thread_id = task_id`** биндится в `bound_trace` в consumer'ах для локальной structlog-корреляции stdout-логов; `trace_id` биндится тем же helper'ом и попадает в JSON-логи.
+- **TTL-retry под одним `x-trace-id`** — `TtlWatchdog` восстанавливает UID из `approve_tasks.run_id`; если историческая строка его не содержит, fallback — валидный UUID v4 `task_id`.
 
 ---
 

@@ -7,6 +7,8 @@ from datetime import datetime
 
 import httpx
 
+from ..utils.tracing import http_trace_headers, resolve_trace_id
+
 logger = logging.getLogger("services.db_client")
 
 
@@ -31,8 +33,10 @@ class DbClient:
         headers_json: dict | None = None,
         thread_id: str,
         task_key: str,
+        run_id: str | None = None,
     ) -> dict:
         """POST /v1/messages/ingest → IngestOut."""
+        trace_id = resolve_trace_id(run_id, payload={"headers_json": headers_json})
         payload = {
             "message_id": message_id,
             "author_email": author_email,
@@ -44,9 +48,14 @@ class DbClient:
             "headers_json": headers_json,
             "thread_id": thread_id,
             "task_key": task_key,
+            "run_id": trace_id,
         }
         async with self._client() as client:
-            resp = await client.post("/v1/messages/ingest", json=payload)
+            resp = await client.post(
+                "/v1/messages/ingest",
+                json=payload,
+                headers=http_trace_headers(trace_id),
+            )
             resp.raise_for_status()
             return resp.json()
 
@@ -61,8 +70,10 @@ class DbClient:
         thread_id: str,
         smtp_payload: dict | None = None,
         task_key: str,
+        run_id: str | None = None,
     ) -> dict:
         """POST /v1/messages/outgoing → OutgoingOut."""
+        trace_id = resolve_trace_id(run_id, payload=smtp_payload)
         payload = {
             "message_id": message_id,
             "author_email": author_email,
@@ -72,9 +83,14 @@ class DbClient:
             "thread_id": thread_id,
             "smtp_payload": smtp_payload,
             "task_key": task_key,
+            "run_id": trace_id,
         }
         async with self._client() as client:
-            resp = await client.post("/v1/messages/outgoing", json=payload)
+            resp = await client.post(
+                "/v1/messages/outgoing",
+                json=payload,
+                headers=http_trace_headers(trace_id),
+            )
             resp.raise_for_status()
             return resp.json()
 
@@ -102,6 +118,7 @@ class DbClient:
         claim_token: str,
         error: str | None = None,
         next_retry_at: datetime | None = None,
+        run_id: str | None = None,
     ) -> None:
         """PATCH /v1/outbox/{task_id}/status."""
         payload: dict = {"status": status, "claim_token": claim_token}
@@ -110,5 +127,9 @@ class DbClient:
         if next_retry_at is not None:
             payload["next_retry_at"] = next_retry_at.isoformat()
         async with self._client() as client:
-            resp = await client.patch(f"/v1/outbox/{task_id}/status", json=payload)
+            resp = await client.patch(
+                f"/v1/outbox/{task_id}/status",
+                json=payload,
+                headers=http_trace_headers(resolve_trace_id(run_id)),
+            )
             resp.raise_for_status()

@@ -15,7 +15,7 @@ from ..models.task import TaskStatus
 from ..services.db_client import DbClient
 from ..services.retry_handler import get_agent_ttl
 from ..utils.logger import get_logger
-from ..utils.tracing import bound_trace
+from ..utils.tracing import bound_trace, resolve_trace_id
 
 log = get_logger(__name__)
 
@@ -59,7 +59,8 @@ class TtlWatchdog:
         now = datetime.now(timezone.utc)
 
         for task in tasks:
-            with bound_trace(thread_id=task.task_id):
+            trace_id = resolve_trace_id(task.run_id, fallback=task.task_id)
+            with bound_trace(trace_id=trace_id, thread_id=task.task_id):
                 attempt = task.attempt_count + 1  # текущая попытка (1-based)
                 ttl = get_agent_ttl(attempt)
                 elapsed = (now - task.updated_at).total_seconds()
@@ -87,11 +88,13 @@ class TtlWatchdog:
                         task.task_id,
                         TaskStatus.FAILED,
                         error_message=err,
+                        run_id=trace_id,
                     )
                     log.error(
                         "agent_ttl_all_attempts_exhausted",
                         task_id=task.task_id,
                         calculation_id=task.calculation_id,
+                        trace_id=trace_id,
                         action="failed",
                         status_from=TaskStatus.SENT_TO_AGENT,
                         status_to=TaskStatus.FAILED,
@@ -122,11 +125,13 @@ class TtlWatchdog:
                         calculation_id=task.calculation_id,
                         parameters=parameters,
                         attempt=next_attempt,
+                        trace_id=trace_id,
                     )
                     log.info(
                         "agent_task_resent",
                         task_id=task.task_id,
                         calculation_id=task.calculation_id,
+                        trace_id=trace_id,
                         action="retry",
                         attempt=next_attempt,
                         new_ttl_seconds=get_agent_ttl(next_attempt),

@@ -107,7 +107,10 @@ class MailIncomingConsumer:
         # thread_id = LangGraph chat_id = AEF session_id (общий ключ корреляции
         # на всём цикле переговоров по треду).
         session_id_cvar.set(thread_id)
-        x_trace_id = bind_x_trace_id(headers=msg.headers() or [])
+        x_trace_id = bind_x_trace_id(
+            trace_id=payload.get("x_trace_id") or payload.get("run_id"),
+            headers=msg.headers() or [],
+        )
         reset_hops()
         trace_headers = kafka_trace_headers(msg.headers() or [])
         agent_input = {

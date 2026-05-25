@@ -21,7 +21,7 @@ from ..services.dlq_handler import DlqHandler
 from ..services.enrichment_service import EnrichmentService
 from ..services.retry_handler import RetryExhausted
 from ..utils.logger import get_logger
-from ..utils.tracing import bound_trace
+from ..utils.tracing import bound_trace, resolve_trace_id, trace_header_list
 
 log = get_logger(__name__)
 
@@ -33,6 +33,14 @@ def _extract_deal_conditions(payload: dict) -> dict:
         for field in DEAL_CONDITION_FIELDS
         if field in payload and payload[field] is not None
     }
+
+
+def _payload_trace_id(payload: dict) -> str | None:
+    for key in ("x_trace_id", "trace_id", "run_id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 class CspAgentConsumer:
@@ -111,23 +119,40 @@ class CspAgentConsumer:
             self._consumer.commit(message=msg)
             return
 
-        deal_conditions = _extract_deal_conditions(payload)
-
-        log.info(
-            "message_received",
-            calculation_id=calculation_id,
-            action="received",
-            has_deal_conditions=bool(deal_conditions),
+        trace_id = resolve_trace_id(
+            _payload_trace_id(payload),
+            headers=msg.headers(),
         )
 
-        try:
-            # Шаг 1: Дедупликация → получаем стабильный task_id.
-            task_id = check_and_register(self._db, calculation_id)
-        except DuplicateError:
-            self._consumer.commit(message=msg)
-            return
+        with bound_trace(trace_id=trace_id):
+            deal_conditions = _extract_deal_conditions(payload)
 
-        with bound_trace(thread_id=task_id):
+            log.info(
+                "message_received",
+                calculation_id=calculation_id,
+                trace_id=trace_id,
+                action="received",
+                has_deal_conditions=bool(deal_conditions),
+            )
+
+            try:
+                # Шаг 1: Дедупликация → получаем стабильный task_id.
+                task_id = check_and_register(
+                    self._db,
+                    calculation_id,
+                    trace_id=trace_id,
+                )
+            except DuplicateError:
+                self._consumer.commit(message=msg)
+                return
+
+            task = self._db.get_task(task_id)
+            operation_trace_id = resolve_trace_id(
+                task.run_id if task else trace_id,
+                fallback=task_id,
+            )
+
+            with bound_trace(trace_id=operation_trace_id, thread_id=task_id):
                 try:
                     # Commit offset после успешной регистрации (спека §4.1, шаг 4)
                     self._consumer.commit(message=msg)
@@ -138,6 +163,7 @@ class CspAgentConsumer:
                         task_id,
                         calculation_id,
                         deal_conditions=deal_conditions,
+                        trace_id=operation_trace_id,
                     )
 
                     # Шаг 3: Отправка задания агенту (спека §4.3).
@@ -146,40 +172,45 @@ class CspAgentConsumer:
                         task_id=task_id,
                         calculation_id=calculation_id,
                         parameters=enriched.parameters,
+                        trace_id=operation_trace_id,
                     )
 
                 except RetryExhausted as exc:
                     log.error(
                         "retry_exhausted_to_dlq",
                         calculation_id=calculation_id,
+                        trace_id=operation_trace_id,
                         error=str(exc),
                     )
-                    self._send_to_dlq(calculation_id)
+                    self._send_to_dlq(calculation_id, trace_id=operation_trace_id)
                     self._consumer.commit(message=msg)
 
                 except Exception as exc:
                     log.error(
                         "message_processing_error",
                         calculation_id=calculation_id,
+                        trace_id=operation_trace_id,
                         error=str(exc),
                     )
-                    self._send_to_dlq(calculation_id)
+                    self._send_to_dlq(calculation_id, trace_id=operation_trace_id)
                     self._consumer.commit(message=msg)
 
-    def _send_to_dlq(self, calculation_id: str) -> None:
+    def _send_to_dlq(self, calculation_id: str, *, trace_id: str | None = None) -> None:
         """Перемещает сообщение в APPROVE_SERVICE_DLQ."""
         from confluent_kafka import Producer
 
+        operation_trace_id = resolve_trace_id(trace_id)
         producer = Producer({"bootstrap.servers": settings.adapter_brokers})
         produce_sync(
             producer,
             topic=settings.dlq_topic,
             key=calculation_id.encode("utf-8"),
             value=json.dumps({"calculation_id": calculation_id}).encode("utf-8"),
+            headers=trace_header_list(trace_id=operation_trace_id),
             timeout=10,
             log=log,
         )
-        log.info("sent_to_dlq", calculation_id=calculation_id)
+        log.info("sent_to_dlq", calculation_id=calculation_id, trace_id=operation_trace_id)
 
     def _process_dlq(self) -> None:
         """Обрабатывает DLQ после опустошения основной очереди (спека §6.1).
@@ -192,11 +223,17 @@ class CspAgentConsumer:
             task = self._db.get_task_by_calculation_id(calc_id)
             if task is None:
                 from src.services.deduplication_service import check_and_register
-                task_id = check_and_register(self._db, calc_id)
+                operation_trace_id = resolve_trace_id(fallback=calc_id)
+                task_id = check_and_register(
+                    self._db,
+                    calc_id,
+                    trace_id=operation_trace_id,
+                )
             else:
                 task_id = task.task_id
+                operation_trace_id = resolve_trace_id(task.run_id, fallback=task_id)
 
-            with bound_trace(thread_id=task_id):
+            with bound_trace(trace_id=operation_trace_id, thread_id=task_id):
                 # Пробуем восстановить сделочные поля из snapshot'а
                 deal_conditions = self._read_deal_conditions_from_snapshot(task_id)
 
@@ -204,11 +241,13 @@ class CspAgentConsumer:
                     task_id,
                     calc_id,
                     deal_conditions=deal_conditions,
+                    trace_id=operation_trace_id,
                 )
                 self._agent_producer.send_task(
                     task_id=task_id,
                     calculation_id=calc_id,
                     parameters=enriched.parameters,
+                    trace_id=operation_trace_id,
                 )
 
         dlq = DlqHandler(self._db, reprocess)

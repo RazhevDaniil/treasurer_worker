@@ -18,6 +18,7 @@ def produce_sync(
     topic: str,
     key: bytes | None,
     value: bytes,
+    headers: list[tuple[str, bytes]] | None = None,
     timeout: float = 10.0,
     log: Any = None,
 ) -> None:
@@ -44,7 +45,13 @@ def produce_sync(
         delivered.set()
 
     try:
-        producer.produce(topic=topic, key=key, value=value, callback=_on_delivery)
+        producer.produce(
+            topic=topic,
+            key=key,
+            value=value,
+            headers=headers,
+            callback=_on_delivery,
+        )
     except (BufferError, KafkaException) as exc:
         raise KafkaDeliveryError(f"kafka enqueue failed: {exc}") from exc
 

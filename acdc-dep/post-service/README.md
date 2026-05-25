@@ -317,12 +317,15 @@ mail_app/
   "reply_to_email": null,
   "subject": "Депозит 50 млн",
   "body": "...",
-  "headers_json": {"In-Reply-To": "..."}
+  "headers_json": {"In-Reply-To": "...", "x-trace-id": "4d6f8c2a-2d6a-4b5f-9d9c-8a0f7b8f5f12"},
+  "x_trace_id": "4d6f8c2a-2d6a-4b5f-9d9c-8a0f7b8f5f12",
+  "run_id": "4d6f8c2a-2d6a-4b5f-9d9c-8a0f7b8f5f12"
 }
 ```
 
 **Headers:**
 
 - `idempotency-key`: `task_id` исходящей задачи (broker-level dedup на стороне consumer'а)
+- `x-trace-id`: сквозной UUID v4 родительской операции; генерируется при ingest IMAP-письма или принимается из HTTP `/api/v1/send_reply`, сохраняется в `db-service.run_id` и прокидывается дальше в Kafka/HTTP.
 
 Consumer на стороне `agent_treasurer` (`MailIncomingConsumer`) после обработки графа вызывает обратный канал — `POST /api/v1/send_reply` с готовыми `recipient_email`, `subject`, `reply_body`, `cc` и т.д.

@@ -9,6 +9,7 @@ from ..services.in_memory_db import InMemoryDbClient
 from ..services.smtp_client import SmtpClient, SmtpPermanentError
 from ..services.email_builder import build_reply_email
 from ..utils.backoff import next_retry_time
+from ..utils.tracing import resolve_trace_id
 
 logger = logging.getLogger("workers.smtp")
 
@@ -55,6 +56,7 @@ class SmtpWorker:
         body_text = payload.get("body_text", "")
         in_reply_to = payload.get("in_reply_to")
         references = payload.get("references")
+        trace_id = resolve_trace_id(payload=payload)
 
         try:
             if not recipient_email:
@@ -73,10 +75,15 @@ class SmtpWorker:
             result = await asyncio.to_thread(lambda: self.smtp.send_message_starttls(msg))
 
             if result.ok:
-                await self.db_client.update_task_status(task_id, "DONE", claim_token)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "DONE",
+                    claim_token,
+                    run_id=trace_id,
+                )
                 logger.info(
-                    "SMTP sent message_id=%s thread_id=%s to=%s task_id=%s",
-                    message_id, thread_id, recipient_email, task_id,
+                    "SMTP sent message_id=%s thread_id=%s to=%s task_id=%s trace_id=%s",
+                    message_id, thread_id, recipient_email, task_id, trace_id,
                 )
                 return
 
@@ -85,29 +92,57 @@ class SmtpWorker:
 
             if 400 <= code < 500:
                 if attempt >= self.settings.max_attempts:
-                    await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+                    await self.db_client.update_task_status(
+                        task_id,
+                        "FAILED",
+                        claim_token,
+                        error=msg_err,
+                        run_id=trace_id,
+                    )
                     return
                 next_retry = next_retry_time(
                     attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
                 )
                 await self.db_client.update_task_status(
-                    task_id, "RETRYING", claim_token, error=msg_err, next_retry_at=next_retry
+                    task_id,
+                    "RETRYING",
+                    claim_token,
+                    error=msg_err,
+                    next_retry_at=next_retry,
+                    run_id=trace_id,
                 )
                 return
 
             if 500 <= code < 600:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg_err,
+                    run_id=trace_id,
+                )
                 return
 
             # Unknown code → retry
             if attempt >= self.settings.max_attempts:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg_err,
+                    run_id=trace_id,
+                )
                 return
             next_retry = next_retry_time(
                 attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
             )
             await self.db_client.update_task_status(
-                task_id, "RETRYING", claim_token, error=msg_err, next_retry_at=next_retry
+                task_id,
+                "RETRYING",
+                claim_token,
+                error=msg_err,
+                next_retry_at=next_retry,
+                run_id=trace_id,
             )
 
         except (EOFError, OSError, socket.error) as e:
@@ -117,18 +152,35 @@ class SmtpWorker:
                 message_id, thread_id, task_id, msg_err,
             )
             if attempt >= self.settings.max_attempts:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg_err,
+                    run_id=trace_id,
+                )
                 return
             next_retry = next_retry_time(
                 attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
             )
             await self.db_client.update_task_status(
-                task_id, "RETRYING", claim_token, error=msg_err, next_retry_at=next_retry
+                task_id,
+                "RETRYING",
+                claim_token,
+                error=msg_err,
+                next_retry_at=next_retry,
+                run_id=trace_id,
             )
 
         except SmtpPermanentError as e:
             msg_err = str(e)
-            await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+            await self.db_client.update_task_status(
+                task_id,
+                "FAILED",
+                claim_token,
+                error=msg_err,
+                run_id=trace_id,
+            )
 
         except Exception as e:
             msg_err = str(e)
@@ -137,11 +189,22 @@ class SmtpWorker:
                 message_id, thread_id, task_id, msg_err,
             )
             if attempt >= self.settings.max_attempts:
-                await self.db_client.update_task_status(task_id, "FAILED", claim_token, error=msg_err)
+                await self.db_client.update_task_status(
+                    task_id,
+                    "FAILED",
+                    claim_token,
+                    error=msg_err,
+                    run_id=trace_id,
+                )
                 return
             next_retry = next_retry_time(
                 attempt, self.settings.backoff_min_seconds, self.settings.backoff_max_seconds
             )
             await self.db_client.update_task_status(
-                task_id, "RETRYING", claim_token, error=msg_err, next_retry_at=next_retry
+                task_id,
+                "RETRYING",
+                claim_token,
+                error=msg_err,
+                next_retry_at=next_retry,
+                run_id=trace_id,
             )

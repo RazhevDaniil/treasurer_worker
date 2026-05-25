@@ -27,6 +27,7 @@ class Task(BaseModel):
     agent_answer: str | None = None
     deal_status: str | None = None
     error_message: str | None = None
+    run_id: str | None = None
 
 
 class TaskCreate(BaseModel):
@@ -35,6 +36,7 @@ class TaskCreate(BaseModel):
     calculation_id: str
     task_status: TaskStatus = TaskStatus.RECEIVED
     attempt_count: int = 0
+    run_id: str | None = None
 
 
 class TaskStatusUpdate(BaseModel):
@@ -44,3 +46,4 @@ class TaskStatusUpdate(BaseModel):
     agent_answer: str | None = None
     attempt_count: int | None = None
     error_message: str | None = None
+    run_id: str | None = None

@@ -15,6 +15,7 @@ import threading
 from confluent_kafka import KafkaException, Producer
 
 from ..config import Settings
+from ..utils.tracing import kafka_trace_headers, payload_with_trace, resolve_trace_id
 
 logger = logging.getLogger("services.agent_client")
 
@@ -54,8 +55,10 @@ class AgentKafkaPublisher:
         Блокирует поток до подтверждения брокером (flush). При delivery error
         бросает AgentPublishError — AgentDispatcher повторит через RETRYING.
         """
-        thread_id = payload.get("thread_id") or ""
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        trace_id = resolve_trace_id(payload=payload)
+        traced_payload = payload_with_trace(payload, trace_id)
+        thread_id = traced_payload.get("thread_id") or ""
+        body = json.dumps(traced_payload, ensure_ascii=False).encode("utf-8")
         delivery_event = threading.Event()
         delivery_error: list[KafkaException] = []
 
@@ -80,7 +83,10 @@ class AgentKafkaPublisher:
                 topic=self.settings.kafka_mail_topic,
                 key=thread_id.encode("utf-8") if thread_id else None,
                 value=body,
-                headers=[("idempotency-key", idempotency_key.encode("utf-8"))],
+                headers=kafka_trace_headers(
+                    trace_id,
+                    [("idempotency-key", idempotency_key.encode("utf-8"))],
+                ),
                 on_delivery=_on_delivery,
             )
         except (BufferError, KafkaException) as exc:

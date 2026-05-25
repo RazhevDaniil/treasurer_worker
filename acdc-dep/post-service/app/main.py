@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from .config import settings
 from .logging_config import setup_logging
@@ -11,6 +11,7 @@ from .api.routes import router as mail_router
 from .api.health import router as health_router
 from .services.db_client import DbClient
 from .services.in_memory_db import InMemoryDbClient
+from .utils.tracing import TRACE_HEADER_NAME, resolve_trace_id
 from .workers.imap_worker import ImapWorker
 from .workers.agent_dispatcher import AgentDispatcher
 from .workers.smtp_worker import SmtpWorker
@@ -22,6 +23,15 @@ setup_logging(settings.log_level)
 app = FastAPI(title=settings.app_name)
 app.include_router(health_router)
 app.include_router(mail_router)
+
+
+@app.middleware("http")
+async def trace_context_middleware(request: Request, call_next):
+    trace_id = resolve_trace_id(headers=request.headers)
+    request.state.x_trace_id = trace_id
+    response = await call_next(request)
+    response.headers[TRACE_HEADER_NAME] = trace_id
+    return response
 
 
 @app.on_event("startup")

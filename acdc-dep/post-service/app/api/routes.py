@@ -3,9 +3,10 @@ from __future__ import annotations
 import uuid
 from hashlib import sha256
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 
 from ..schemas.api import SendReplyRequest, SendReplyResponse
+from ..utils.tracing import TRACE_HEADER_NAME, payload_with_trace, resolve_trace_id
 
 router = APIRouter(prefix="/api/v1", tags=["mail"])
 
@@ -22,6 +23,10 @@ def _thread_root(references: str | None) -> str | None:
 async def send_reply(req: SendReplyRequest, request: Request) -> SendReplyResponse:
     db_client = request.app.state.db_client
     settings = request.app.state.settings
+    trace_id = resolve_trace_id(
+        getattr(request.state, "x_trace_id", None),
+        headers=request.headers,
+    )
 
     domain = (
         settings.smtp_from_address.split("@")[-1]
@@ -41,10 +46,11 @@ async def send_reply(req: SendReplyRequest, request: Request) -> SendReplyRespon
         headers["In-Reply-To"] = req.in_reply_to
     if req.references:
         headers["References"] = req.references
+    headers[TRACE_HEADER_NAME] = trace_id
 
     thread_id = req.thread_id or _thread_root(req.references) or req.in_reply_to or message_id
 
-    smtp_payload = {
+    smtp_payload = payload_with_trace({
         "message_id": message_id,
         "thread_id": thread_id,
         "recipient_email": req.recipient_email,
@@ -53,7 +59,7 @@ async def send_reply(req: SendReplyRequest, request: Request) -> SendReplyRespon
         "body_text": req.reply_body,
         "in_reply_to": req.in_reply_to,
         "references": req.references,
-    }
+    }, trace_id)
 
     result = await db_client.save_outgoing(
         message_id=message_id,
@@ -64,6 +70,7 @@ async def send_reply(req: SendReplyRequest, request: Request) -> SendReplyRespon
         thread_id=thread_id,
         smtp_payload=smtp_payload,
         task_key=task_key,
+        run_id=trace_id,
     )
 
     return SendReplyResponse(

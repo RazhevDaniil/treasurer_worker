@@ -20,7 +20,12 @@ class DuplicateError(Exception):
     pass
 
 
-def check_and_register(db: DbClient, calculation_id: str) -> str:
+def check_and_register(
+    db: DbClient,
+    calculation_id: str,
+    *,
+    trace_id: str | None = None,
+) -> str:
     """Проверяет дедупликацию и регистрирует новую задачу.
 
     Returns:
@@ -56,6 +61,7 @@ def check_and_register(db: DbClient, calculation_id: str) -> str:
             TaskStatus.RECEIVED,
             attempt_count=0,
             error_message="",
+            run_id=trace_id or existing.run_id,
         )
         return existing.task_id
 
@@ -68,5 +74,5 @@ def check_and_register(db: DbClient, calculation_id: str) -> str:
         action="received",
         status_to=TaskStatus.RECEIVED,
     )
-    db.create_task(task_id=task_id, calculation_id=calculation_id)
+    db.create_task(task_id=task_id, calculation_id=calculation_id, run_id=trace_id)
     return task_id

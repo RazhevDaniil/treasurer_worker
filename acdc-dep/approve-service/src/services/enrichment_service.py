@@ -22,6 +22,7 @@ from ..models.task import TaskStatus
 from ..services.db_client import DbClient
 from ..services.retry_handler import retry_with_backoff
 from ..utils.logger import get_logger
+from ..utils.tracing import current_trace_id, resolve_trace_id, trace_header_dict
 
 log = get_logger(__name__)
 
@@ -47,6 +48,7 @@ def map_parameters_to_snapshot(
     calc_id: str,
     task_id: str,
     parameters: dict[str, Any],
+    trace_id: str | None = None,
 ) -> SnapshotCreate:
     """Превращает свободный dict в плоский SnapshotCreate.
 
@@ -55,6 +57,7 @@ def map_parameters_to_snapshot(
     values: dict[str, Any] = {
         "calc_id": calc_id,
         "task_id": task_id,
+        "run_id": trace_id,
     }
 
     for field in FINANCIAL_SNAPSHOT_FIELDS + DEAL_CONDITION_FIELDS:
@@ -88,18 +91,21 @@ class EnrichmentService:
         task_id: str,
         calculation_id: str,
         deal_conditions: dict[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> CalcSearchResponse:
         """Обогащает расчёт: запрос в CalcFundCost → snapshot → статус ENRICHED.
 
         deal_conditions — параметры сделки из входящего сообщения (inn, term_days,
         volume, currency, ...), вливаются в snapshot и далее в AgentTask.
         """
+        operation_trace_id = resolve_trace_id(trace_id or current_trace_id(), fallback=task_id)
         request_body = CalcSearchRequest(id=calculation_id)
 
         def _call_api() -> CalcSearchResponse:
             resp = self._client.post(
                 "/api/v1/calculations/search",
                 json=request_body.model_dump(),
+                headers=trace_header_dict(trace_id=operation_trace_id),
             )
             resp.raise_for_status()
             return CalcSearchResponse.model_validate(resp.json())
@@ -117,6 +123,7 @@ class EnrichmentService:
             calc_id=result.id,
             task_id=task_id,
             parameters=merged,
+            trace_id=operation_trace_id,
         )
         self._db.save_snapshot(snapshot)
 

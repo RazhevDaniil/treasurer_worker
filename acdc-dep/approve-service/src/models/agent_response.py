@@ -18,6 +18,8 @@ class AgentTask(BaseModel):
     parameters: dict[str, Any]
     created_at: str  # ISO-8601
     ttl_seconds: int
+    x_trace_id: str | None = None
+    run_id: str | None = None
 
 
 class AgentResult(BaseModel):

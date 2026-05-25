@@ -90,7 +90,10 @@ class ApproveTaskConsumer:
         # subtree share the same `attributes.aef.session_id`.
         session_id_cvar.set(task.task_id)
         incoming_headers = msg.headers() or []
-        x_trace_id = extract_x_trace_id(incoming_headers) or ensure_x_trace_id(task.task_id)
+        x_trace_id = (
+            extract_x_trace_id(incoming_headers)
+            or ensure_x_trace_id(task.x_trace_id or task.run_id or task.task_id)
+        )
         bind_x_trace_id(x_trace_id)
         reset_hops()
         trace_headers = kafka_trace_headers(incoming_headers)
