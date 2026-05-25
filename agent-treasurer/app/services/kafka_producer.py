@@ -8,7 +8,14 @@ import logging
 from confluent_kafka import KafkaException, Producer
 
 from ..core.config import settings
-from ..core.tracing import aef_kafka_produce, kafka_trace_headers
+from ..core.tracing import (
+    aef_kafka_produce,
+    kafka_trace_headers,
+    record_hop,
+    safe_span_attributes,
+    safe_span_output,
+    safe_trace_json,
+)
 from ..models.approve_schemas import AgentDecision, AgentResult
 
 logger = logging.getLogger(__name__)
@@ -70,12 +77,42 @@ class AgentResultProducer:
             kafka_cluster=settings.kafka_cluster_name,
             bootstrap_servers=settings.adapter_brokers.split(","),
         ) as kafka_span:
-            kafka_span.add_span_attributes(**{
+            hop = record_hop()
+            safe_span_attributes(kafka_span, **{
+                "aef.action": "approve_app.publish_result",
+                "aef.call_type": "service_call",
+                "aef.target_name": f"kafka.topic.{settings.kafka_in_topic}",
+                "aef.agent_uid": settings.aef_agent_id,
+                "aef.agent_name": settings.aef_agent_id,
+                "aef.operation_uid": dict(headers).get("x-trace-id", b"").decode("utf-8"),
+                "aef.parent_operation_uid": dict(headers).get("x-trace-id", b"").decode("utf-8"),
                 "aef.is_mutation": True,
                 "aef.rollback_possible": False,
+                "aef.hops": settings.operation_max_hops,
+                "aef.hops_used": hop,
+                "aef.ttl": settings.operation_ttl_sec,
+                "aef.stop_event": None,
                 "aef.x_trace_id": dict(headers).get("x-trace-id", b"").decode("utf-8"),
+                "aef.request_payload": safe_trace_json(result.model_dump()),
+                "aef.executable_json": safe_trace_json(result.model_dump()),
             })
             self._produce_sync(task_id=task_id, body=body, headers=headers)
+            safe_span_attributes(kafka_span, **{
+                "aef.result_payload": safe_trace_json({
+                    "published": True,
+                    "topic": settings.kafka_in_topic,
+                    "task_id": task_id,
+                    "calculation_id": calculation_id,
+                    "decision": decision,
+                })
+            })
+            safe_span_output(kafka_span, {
+                "published": True,
+                "topic": settings.kafka_in_topic,
+                "task_id": task_id,
+                "calculation_id": calculation_id,
+                "decision": decision,
+            })
 
             logger.info(
                 f"approve_result_sent. task_id={task_id} "

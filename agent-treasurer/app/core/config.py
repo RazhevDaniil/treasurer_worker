@@ -159,6 +159,10 @@ class Settings(BaseSettings):
         default="Извините, ответ агента занимает слишком много времени. Пожалуйста, попробуйте написать ещё раз.",
         description="User-facing message returned when operation_ttl_sec is exceeded.",
     )
+    operation_max_hops: int = Field(
+        default=20,
+        description="Maximum external calls/attempts recorded as hops for one agent operation.",
+    )
 
     # === Per-currency limits: RUB FIX ===
     rub_fix_min_term: int = Field(default=1, description="RUB FIX: мин. срок (дней)")
@@ -327,6 +331,11 @@ class Settings(BaseSettings):
         default=10_485_760,
         validation_alias="AEF_KAFKA_MAX_REQUEST_SIZE",
         description="max_request_size (bytes) for the AEF Controller Kafka producer. 10 MB by default.",
+    )
+    tracing_max_payload_size: int = Field(
+        default=10_000,
+        validation_alias="TRACING_MAX_PAYLOAD_SIZE",
+        description="Maximum serialized request/response payload size stored in trace attributes.",
     )
     aef_agent_id: str = Field(
         default="prototype-treasurer",

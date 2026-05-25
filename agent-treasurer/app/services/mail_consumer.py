@@ -23,8 +23,13 @@ from ..core.tracing import (
     aef_agent_start,
     aef_kafka_consume,
     bind_x_trace_id,
+    current_hops,
     get_aef_handler,
     kafka_trace_headers,
+    reset_hops,
+    safe_span_attributes,
+    safe_span_output,
+    safe_trace_json,
     session_id_cvar,
 )
 from .email_service import EmailService
@@ -103,7 +108,15 @@ class MailIncomingConsumer:
         # на всём цикле переговоров по треду).
         session_id_cvar.set(thread_id)
         x_trace_id = bind_x_trace_id(headers=msg.headers() or [])
+        reset_hops()
         trace_headers = kafka_trace_headers(msg.headers() or [])
+        agent_input = {
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "message": message_text,
+            "message_len": len(message_text),
+            "x_trace_id": x_trace_id,
+        }
 
         with aef_kafka_consume(
             span_name="consume_mail_incoming",
@@ -114,19 +127,19 @@ class MailIncomingConsumer:
             bootstrap_servers=settings.adapter_brokers.split(","),
             consumer_group=settings.kafka_mail_group_id,
         ):
-            with aef_agent_start(input={
-                "thread_id": thread_id,
-                "message_id": message_id,
-                "message_len": len(message_text),
-                "x_trace_id": x_trace_id,
-            }) as agent_span:
-                agent_span.add_span_attributes(**{
+            with aef_agent_start(input=agent_input) as agent_span:
+                safe_span_attributes(agent_span, **{
                     "aef.agent_uid": settings.aef_agent_id,
+                    "aef.agent_name": settings.aef_agent_id,
                     "aef.session_id": thread_id,
                     "aef.ttl": settings.operation_ttl_sec,
-                    "aef.hops": None,
+                    "aef.hops": settings.operation_max_hops,
+                    "aef.hops_used": current_hops(),
                     "aef.stop_event": None,
                     "aef.x_trace_id": x_trace_id,
+                    "aef.operation_uid": x_trace_id,
+                    "aef.parent_operation_uid": x_trace_id,
+                    "aef.executable_json": safe_trace_json(agent_input),
                 })
 
                 logger.info(
@@ -146,7 +159,10 @@ class MailIncomingConsumer:
                         f"mail_process_failed. thread_id={thread_id} "
                         f"message_id={message_id} error={exc}"
                     )
-                    agent_span.add_span_attributes(**{"aef.stop_event": "process_failed"})
+                    safe_span_attributes(agent_span, **{
+                        "aef.stop_event": "process_failed",
+                        "aef.hops_used": current_hops(),
+                    })
                     # Коммитим, чтобы не зацикливаться на яде; ошибка уже в логах.
                     self._consumer.commit(message=msg)
                     return
@@ -156,12 +172,20 @@ class MailIncomingConsumer:
                         f"mail_reply_not_queued. thread_id={thread_id} "
                         f"message_id={message_id} destination={result.get('destination')}"
                     )
-                    agent_span.add_span_attributes(**{"aef.stop_event": "mail_reply_not_queued"})
-                    agent_span.add_output_result(output=result)
+                    safe_span_attributes(agent_span, **{
+                        "aef.stop_event": "mail_reply_not_queued",
+                        "aef.hops_used": current_hops(),
+                        "aef.result_payload": safe_trace_json(result),
+                    })
+                    safe_span_output(agent_span, result)
                     return
 
                 self._consumer.commit(message=msg)
-                agent_span.add_output_result(output=result)
+                safe_span_attributes(agent_span, **{
+                    "aef.hops_used": current_hops(),
+                    "aef.result_payload": safe_trace_json(result),
+                })
+                safe_span_output(agent_span, result)
 
                 logger.info(
                     f"mail_message_processed. thread_id={thread_id} "
@@ -220,7 +244,10 @@ class MailIncomingConsumer:
                 f"mail_operation_ttl_exceeded. thread_id={thread_id} "
                 f"ttl_sec={settings.operation_ttl_sec}"
             )
-            agent_span.add_span_attributes(**{"aef.stop_event": "ttl_exceeded"})
+            safe_span_attributes(agent_span, **{
+                "aef.stop_event": "ttl_exceeded",
+                "aef.hops_used": current_hops(),
+            })
             answer = settings.operation_ttl_user_message
             destination = "error"
             manager_email: str | None = None
@@ -228,7 +255,10 @@ class MailIncomingConsumer:
             answer = final_state.response_message
             if not answer:
                 logger.warning(f"mail_no_answer. thread_id={thread_id}")
-                agent_span.add_span_attributes(**{"aef.stop_event": "no_answer"})
+                safe_span_attributes(agent_span, **{
+                    "aef.stop_event": "no_answer",
+                    "aef.hops_used": current_hops(),
+                })
                 return {"destination": "error", "reason": "no_answer"}
 
             destination = "agent"
@@ -241,8 +271,9 @@ class MailIncomingConsumer:
                 )
             elif final_state.phase == "error":
                 destination = "error"
-                agent_span.add_span_attributes(**{
-                    "aef.stop_event": final_state.stop_event or "phase_error"
+                safe_span_attributes(agent_span, **{
+                    "aef.stop_event": final_state.stop_event or "phase_error",
+                    "aef.hops_used": current_hops(),
                 })
 
         # Сборка reply (логика, ранее жившая в mail_app._enqueue_reply).

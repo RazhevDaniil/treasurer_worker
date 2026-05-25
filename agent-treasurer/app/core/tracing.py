@@ -18,9 +18,12 @@ Module surface:
                             span produced inside the request.
 """
 
+import json
 import logging
+import sys
 import uuid
 from contextvars import ContextVar
+from contextlib import contextmanager
 from collections.abc import Mapping
 from typing import Any, Iterable
 
@@ -52,6 +55,7 @@ logger = logging.getLogger(__name__)
 _HANDLER: AEFHandler | None = None
 X_TRACE_ID_HEADER = "x-trace-id"
 x_trace_id_cvar: ContextVar[str | None] = ContextVar("x_trace_id", default=None)
+hop_count_cvar: ContextVar[int] = ContextVar("hop_count", default=0)
 
 
 def _decode_header_value(value: Any) -> str | None:
@@ -139,6 +143,215 @@ def kafka_trace_headers(extra: Iterable[tuple[str, Any]] | Mapping[str, Any] | N
     return headers
 
 
+def reset_hops() -> None:
+    hop_count_cvar.set(0)
+
+
+def current_hops() -> int:
+    return hop_count_cvar.get()
+
+
+def record_hop() -> int:
+    """Record one outgoing call/attempt and return the new hop count."""
+    value = hop_count_cvar.get() + 1
+    hop_count_cvar.set(value)
+    return value
+
+
+def safe_trace_payload(value: Any) -> Any:
+    """JSON-safe, size-bounded payload for trace attributes/results."""
+    try:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(value)
+
+    limit = settings.tracing_max_payload_size
+    if len(raw) > limit:
+        raw = raw[:limit] + "...<truncated>"
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def safe_trace_json(value: Any) -> str:
+    payload = safe_trace_payload(value)
+    if isinstance(payload, str):
+        return payload
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        return str(payload)
+
+
+def safe_trace_attribute_value(value: Any) -> Any:
+    """Value safe enough for SDK span attributes."""
+    if value is None:
+        return ""
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        limit = settings.tracing_max_payload_size
+        return value if len(value) <= limit else value[:limit] + "...<truncated>"
+    return safe_trace_json(value)
+
+
+def safe_trace_attributes(attrs: Mapping[str, Any]) -> dict[str, Any]:
+    """Best-effort conversion of arbitrary mapping to trace attributes."""
+    return {str(key): safe_trace_attribute_value(value) for key, value in attrs.items()}
+
+
+class SafeTraceSpan:
+    """Small adapter that makes tracing best-effort for production code."""
+
+    def __init__(self, span: Any = None) -> None:
+        self._span = span
+        self._failed = False
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def add_span_attributes(self, **attrs: Any) -> None:
+        if self._span is None:
+            return
+        try:
+            self._span.add_span_attributes(**safe_trace_attributes(attrs))
+        except Exception as exc:
+            logger.warning(f"trace_add_attrs_failed. error={exc}")
+
+    def add_output_result(self, output: Any = None) -> None:
+        if self._span is None:
+            return
+        try:
+            self._span.add_output_result(output=safe_trace_payload(output))
+        except Exception as exc:
+            logger.warning(f"trace_add_output_failed. error={exc}")
+
+    def add_response(
+        self,
+        *,
+        body: Any = None,
+        headers: Mapping[str, Any] | None = None,
+        http_code: int | None = None,
+    ) -> None:
+        if self._span is None:
+            return
+        try:
+            self._span.add_response(
+                headers=safe_trace_attributes(headers or {}),
+                body=safe_trace_payload(body),
+                http_code=http_code,
+            )
+        except Exception as exc:
+            logger.warning(f"trace_add_response_failed. error={exc}")
+
+    def record_error(self, exc: BaseException | str) -> None:
+        self._failed = True
+        message = str(exc)
+        self.add_span_attributes(
+            **{
+                "aef.status": "error",
+                "aef.error_message": message,
+                "aef.hops_used": current_hops(),
+            }
+        )
+
+
+@contextmanager
+def trace_action_span(
+    action_name: str,
+    *,
+    call_type: str = "action",
+    target_name: str | None = None,
+    request_payload: Any = None,
+    is_mutation: bool = False,
+    rollback_possible: bool | None = None,
+    extra_attrs: Mapping[str, Any] | None = None,
+):
+    """Best-effort custom span for actions, service calls and state changes."""
+    attrs: dict[str, Any] = {
+        "aef.kind": call_type,
+        "aef.action": action_name,
+        "aef.action_name": action_name,
+        "aef.call_type": call_type,
+        "aef.agent_uid": settings.aef_agent_id,
+        "aef.agent_name": settings.aef_agent_id,
+        "aef.operation_uid": current_x_trace_id(),
+        "aef.parent_operation_uid": current_x_trace_id(),
+        "aef.x_trace_id": current_x_trace_id(),
+        "aef.hops": settings.operation_max_hops,
+        "aef.hops_used": current_hops(),
+        "aef.ttl": settings.operation_ttl_sec,
+        "aef.stop_event": None,
+        "aef.is_mutation": is_mutation,
+    }
+    if target_name is not None:
+        attrs["aef.target_name"] = target_name
+    if rollback_possible is not None:
+        attrs["aef.rollback_possible"] = rollback_possible
+    if request_payload is not None:
+        attrs["aef.request_payload"] = safe_trace_json(request_payload)
+        attrs["aef.executable_json"] = safe_trace_json(request_payload)
+    if extra_attrs:
+        attrs.update(safe_trace_attributes(extra_attrs))
+
+    cm = None
+    exc_info = (None, None, None)
+    span = SafeTraceSpan()
+    try:
+        cm = aef_custom_span(span_attributes=safe_trace_attributes(attrs))
+        span = SafeTraceSpan(cm.__enter__())
+    except Exception as exc:
+        logger.warning(f"trace_span_start_failed. action={action_name} error={exc}")
+
+    try:
+        yield span
+    except Exception as exc:
+        exc_info = sys.exc_info()
+        span.record_error(exc)
+        raise
+    else:
+        if not span.failed:
+            span.add_span_attributes(
+                **{
+                    "aef.status": "ok",
+                    "aef.hops_used": current_hops(),
+                }
+            )
+    finally:
+        if cm is not None:
+            try:
+                cm.__exit__(*exc_info)
+            except Exception as exc:
+                logger.warning(f"trace_span_finish_failed. action={action_name} error={exc}")
+
+
+def safe_span_attributes(span: Any, **attrs: Any) -> None:
+    SafeTraceSpan(span).add_span_attributes(**attrs)
+
+
+def safe_span_output(span: Any, output: Any) -> None:
+    SafeTraceSpan(span).add_output_result(output=output)
+
+
+def safe_span_response(
+    span: Any,
+    *,
+    body: Any = None,
+    headers: Mapping[str, Any] | None = None,
+    http_code: int | None = None,
+) -> None:
+    SafeTraceSpan(span).add_response(body=body, headers=headers, http_code=http_code)
+
+
+def safe_span_error(span: Any, exc: BaseException | str) -> None:
+    SafeTraceSpan(span).record_error(exc)
+
+
 def init_tracing() -> AEFHandler:
     """Initialise the AEF tracer provider, Kafka sender, batch exporter
     and the langchain `AEFHandler`. Idempotent on repeated calls.
@@ -212,8 +425,18 @@ __all__ = [
     "x_trace_id_cvar",
     "bind_x_trace_id",
     "current_x_trace_id",
+    "current_hops",
     "ensure_x_trace_id",
     "extract_x_trace_id",
     "kafka_trace_headers",
+    "record_hop",
+    "reset_hops",
+    "safe_span_attributes",
+    "safe_span_error",
+    "safe_span_output",
+    "safe_span_response",
+    "safe_trace_json",
+    "safe_trace_payload",
     "trace_header_dict",
+    "trace_action_span",
 ]

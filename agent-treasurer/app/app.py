@@ -15,8 +15,14 @@ from .core.tracing import (
     aef_agent_start,
     aef_input_request,
     bind_x_trace_id,
+    current_hops,
     get_aef_handler,
     init_tracing,
+    reset_hops,
+    safe_span_attributes,
+    safe_span_output,
+    safe_span_response,
+    safe_trace_json,
     session_id_cvar,
     trace_header_dict,
 )
@@ -127,12 +133,10 @@ async def ready():
 
 
 def _chat_input_body(req: ChatRequest) -> dict:
-    """Body passed to `aef_input_request` — strips the message text to keep
-    proto-message size within the AEF Kafka `max_request_size` budget. The
-    raw message can still reach SECURITY §26 logs via stdlib logging.
-    """
+    """Executable request JSON stored in the operation trace."""
     return {
         "chat_id": req.chat_id,
+        "message": req.message,
         "message_len": len(req.message or ""),
     }
 
@@ -145,6 +149,7 @@ async def chat(req: ChatRequest, request: Request, response: Response) -> ChatRe
     If the caller did not pass a valid UUID v4, the agent creates one and
     returns it in the response header."""
     x_trace_id = bind_x_trace_id(headers=request.headers)
+    reset_hops()
     response.headers["x-trace-id"] = x_trace_id
     session_id_cvar.set(req.chat_id)
     logger.info(
@@ -152,33 +157,45 @@ async def chat(req: ChatRequest, request: Request, response: Response) -> ChatRe
         f"message={req.message[:120]!r}"
     )
 
+    input_body = {**_chat_input_body(req), "x_trace_id": x_trace_id}
+
     with aef_input_request(
         span_name="chat",
         headers=trace_header_dict(dict(request.headers)),
-        body=_chat_input_body(req),
+        body=input_body,
         path="/chat",
         method="POST",
     ) as input_req:
-        with aef_agent_start(input=_chat_input_body(req)) as agent_span:
-            agent_span.add_span_attributes(**{
+        with aef_agent_start(input=input_body) as agent_span:
+            safe_span_attributes(agent_span, **{
                 "aef.agent_uid": settings.aef_agent_id,
+                "aef.agent_name": settings.aef_agent_id,
                 "aef.session_id": req.chat_id,
                 "aef.ttl": settings.operation_ttl_sec,
-                "aef.hops": None,
+                "aef.hops": settings.operation_max_hops,
+                "aef.hops_used": current_hops(),
                 "aef.stop_event": None,
                 "aef.x_trace_id": x_trace_id,
+                "aef.operation_uid": x_trace_id,
+                "aef.parent_operation_uid": x_trace_id,
+                "aef.executable_json": safe_trace_json(input_body),
             })
 
-            response = await _dispatch_chat(req, agent_span)
+            chat_response = await _dispatch_chat(req, agent_span)
 
-            agent_span.add_output_result(output=response.model_dump())
+            safe_span_attributes(agent_span, **{
+                "aef.hops_used": current_hops(),
+                "aef.result_payload": safe_trace_json(chat_response.model_dump()),
+            })
+            safe_span_output(agent_span, chat_response.model_dump())
 
-        input_req.add_response(
+        safe_span_response(
+            input_req,
             headers=trace_header_dict(),
-            body=response.model_dump(),
+            body=chat_response.model_dump(),
             http_code=200,
         )
-        return response
+        return chat_response
 
 
 async def _dispatch_chat(req: ChatRequest, agent_span) -> ChatResponse:
@@ -208,14 +225,20 @@ async def _dispatch_chat(req: ChatRequest, agent_span) -> ChatResponse:
             f"operation_ttl_exceeded. chat_id={req.chat_id} "
             f"ttl_sec={settings.operation_ttl_sec}"
         )
-        agent_span.add_span_attributes(**{"aef.stop_event": "ttl_exceeded"})
+        safe_span_attributes(agent_span, **{
+            "aef.stop_event": "ttl_exceeded",
+            "aef.hops_used": current_hops(),
+        })
         return ChatResponse(
             answer=settings.operation_ttl_user_message,
             destination="error",
         )
     except Exception as e:
         logger.error(f"process_failed. chat_id={req.chat_id} error={e}")
-        agent_span.add_span_attributes(**{"aef.stop_event": "process_failed"})
+        safe_span_attributes(agent_span, **{
+            "aef.stop_event": "process_failed",
+            "aef.hops_used": current_hops(),
+        })
         return ChatResponse(
             answer="Произошла ошибка при обработке сообщения. Попробуйте позже.",
             destination="error",
@@ -232,8 +255,9 @@ async def _dispatch_chat(req: ChatRequest, agent_span) -> ChatResponse:
         )
     elif final_state.phase == "error":
         destination = "error"
-        agent_span.add_span_attributes(**{
-            "aef.stop_event": final_state.stop_event or "phase_error"
+        safe_span_attributes(agent_span, **{
+            "aef.stop_event": final_state.stop_event or "phase_error",
+            "aef.hops_used": current_hops(),
         })
 
     logger.info(

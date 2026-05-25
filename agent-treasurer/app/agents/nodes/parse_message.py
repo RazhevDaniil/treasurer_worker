@@ -25,6 +25,7 @@ from ...core.llm_retry import (
     llm_retrying_async,
     log_llm_exhausted,
 )
+from ...core.tracing import record_hop, safe_trace_json, trace_action_span
 from ...models.schemas import (
     Deal,
     DealConditions,
@@ -331,13 +332,37 @@ async def _extract_deal_conditions(message_text: str) -> DealConditions:
         SystemMessage(content=CONDITIONS_EXTRACTION_PROMPT),
         HumanMessage(content=message_text),
     ]
-    try:
-        async for attempt in llm_retrying_async():
-            with attempt:
-                result = await llm.ainvoke(messages)
-    except Exception as exc:
-        log_llm_exhausted(exc, purpose="extract_deal_conditions")
-        raise
+    with trace_action_span(
+        "llm.extract_deal_conditions",
+        call_type="llm_call",
+        target_name="GigaChat",
+        request_payload={
+            "purpose": "extract_deal_conditions",
+            "message_text": message_text,
+            "messages": [m.content for m in messages],
+        },
+        is_mutation=False,
+        rollback_possible=None,
+        extra_attrs={
+            "aef.llm_purpose": "extract_deal_conditions",
+        },
+    ) as span:
+        try:
+            result = None
+            async for attempt in llm_retrying_async():
+                with attempt:
+                    hop = record_hop()
+                    span.add_span_attributes(**{"aef.hops_used": hop})
+                    result = await llm.ainvoke(messages)
+        except Exception as exc:
+            if is_gigaplatform_stop_event(exc):
+                span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})
+            log_llm_exhausted(exc, purpose="extract_deal_conditions")
+            raise
+        span.add_span_attributes(**{
+            "aef.response_payload": safe_trace_json(result),
+        })
+        span.add_output_result(result)
     if result is None:
         logger.warning("extract_conditions_llm_returned_none")
         result_payload = {}
@@ -401,13 +426,38 @@ async def _extract_reply_update(
         HumanMessage(content=fragment.text),
     ]
 
-    try:
-        async for attempt in llm_retrying_async():
-            with attempt:
-                raw_update = await llm.ainvoke(messages)
-    except Exception as exc:
-        log_llm_exhausted(exc, purpose="extract_reply_update")
-        raise
+    with trace_action_span(
+        "llm.extract_reply_update",
+        call_type="llm_call",
+        target_name="GigaChat",
+        request_payload={
+            "purpose": "extract_reply_update",
+            "fragment": fragment,
+            "existing_deals": existing_deals,
+            "messages": [m.content for m in messages],
+        },
+        is_mutation=False,
+        rollback_possible=None,
+        extra_attrs={
+            "aef.llm_purpose": "extract_reply_update",
+        },
+    ) as span:
+        try:
+            raw_update = None
+            async for attempt in llm_retrying_async():
+                with attempt:
+                    hop = record_hop()
+                    span.add_span_attributes(**{"aef.hops_used": hop})
+                    raw_update = await llm.ainvoke(messages)
+        except Exception as exc:
+            if is_gigaplatform_stop_event(exc):
+                span.add_span_attributes(**{"aef.stop_event": GIGAPLATFORM_STOP_EVENT})
+            log_llm_exhausted(exc, purpose="extract_reply_update")
+            raise
+        span.add_span_attributes(**{
+            "aef.response_payload": safe_trace_json(raw_update),
+        })
+        span.add_output_result(raw_update)
     if raw_update is None:
         logger.warning("extract_reply_update_llm_returned_none")
         update = _fallback_reply_update(fragment)
